@@ -1,0 +1,302 @@
+"""Typed generation config: the single source of truth for what drives a render.
+
+The control plane and this backend used to meet over an untyped `overrides` dict (the backend
+would `overrides.get("some_knob")` and the planner had no authoritative list of what it could
+send). This module replaces that grab-bag with typed config objects where **every field maps to
+a real, documented model parameter**, carries a sane default and a clamped range, and reads the
+same per quality tier on both sides.
+
+Two configs are load-bearing for the GPU work and are defined first:
+  - `KeyframeConfig` -- the SDXL keyframe stage (diffusers SDXL + the multi-character identity
+    stack: regional engine, pose ControlNet, per-slot LoRA / IP-Adapter, InstantID).
+  - `I2VConfig` -- the Wan 2.2 image-to-video stage (frames / fps / steps / guidance / shift,
+    the Wan2.2-Lightning distill path, and the final-tier feature cache).
+
+Provenance (clean-room): field names and ranges mirror the control plane's own emitted shape
+(`skyphusion-llm-public` `src/runpod-submit.ts`, Conrad's code); defaults are set from the
+NEW backend's model stack, taken from each model's own public docs (June 2026):
+  - SDXL keyframe steps/cfg/scheduler: diffusers SDXL pipeline; few-step distill: ByteDance
+    Hyper-SD SDXL (2/4/8-step LoRAs run cfg=0 on DDIM `timestep_spacing="trailing"`; the
+    unified 1-step LoRA runs on TCDScheduler).
+  - Wan 2.2 I2V: Wan-AI/Wan2.2-I2V-A14B-Diffusers documents 40 steps, guidance 3.5, 81 frames
+    at 16fps; the lightx2v/Wan2.2-Lightning distill runs 4 steps with CFG off (~1.0).
+In-repo cross-refs: `models.DEFAULT_SPECS` (the real HF ids), `orchestrator.MULTI_CHAR_DEFAULTS`
+(the anti-bleed scales), `routing.QualityTier` (draft / standard / final).
+
+Pure dataclasses + enums, no model imports at module top: this loads and unit-tests on a CPU box.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Any
+
+from .models import DEFAULT_SPECS, ModelRole
+from .routing import QualityTier
+
+
+# --------------------------------------------------------------------------- helpers
+
+def _clamp(value: Any, lo: float, hi: float, default: float) -> float:
+    """Coerce `value` to a float inside [lo, hi]; fall back to `default` on junk. The contract
+    stays forgiving: a planner that sends an out-of-range or non-numeric knob gets clamped, not
+    an exception."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _clamp_int(value: Any, lo: int, hi: int, default: int) -> int:
+    return int(_clamp(value, lo, hi, default))
+
+
+def _enum_or(enum_cls, value: Any, default):
+    """Parse `value` into `enum_cls`, returning `default` for anything unrecognized. Accepts an
+    already-typed member (so `from_dict(to_dict())` round-trips) as well as a wire string."""
+    if isinstance(value, enum_cls):
+        return value
+    try:
+        return enum_cls(str(value).lower())
+    except (ValueError, AttributeError):
+        return default
+
+
+def _model_id(role: ModelRole) -> str:
+    return DEFAULT_SPECS[role].repo_id
+
+
+# --------------------------------------------------------------------------- enums
+
+class Scheduler(str, Enum):
+    """Diffusers SDXL sampler. The few-step distill paths pin specific schedulers: Hyper-SD
+    fixed-step LoRAs want `DDIM_TRAILING` (DDIM with timestep_spacing="trailing"), the unified
+    1-step LoRA wants `TCD`. The full-step path is free to use a higher-order solver."""
+    EULER = "euler"                    # EulerDiscreteScheduler
+    EULER_A = "euler_ancestral"        # EulerAncestralDiscreteScheduler
+    DPMPP_2M = "dpmpp_2m"              # DPMSolverMultistepScheduler
+    DPMPP_2M_KARRAS = "dpmpp_2m_karras"  # DPMSolverMultistepScheduler(use_karras_sigmas=True)
+    UNIPC = "unipc"                    # UniPCMultistepScheduler
+    DDIM = "ddim"                      # DDIMScheduler
+    DDIM_TRAILING = "ddim_trailing"    # DDIMScheduler(timestep_spacing="trailing") -- Hyper-SD
+    TCD = "tcd"                        # TCDScheduler -- Hyper-SD unified LoRA
+
+
+class IdentityMethod(str, Enum):
+    """How a character's face is pinned onto the keyframe. IP-Adapter pulls identity from the
+    reference embedding; InstantID adds a face-ControlNet for stronger structural lock; BOTH
+    stacks them (strongest, slowest). Mirrors the control plane's `face_lock` mode union."""
+    IP_ADAPTER = "ip_adapter"
+    INSTANTID = "instantid"
+    BOTH = "both"
+
+
+class I2VLoader(str, Enum):
+    """Which loader applies the Wan2.2-Lightning distill LoRA. `DIFFUSERS` uses
+    `pipe.load_lora_weights`; that path hits a known compat issue on some Wan LoRAs
+    (diffusers #12535), so `LIGHTX2V` (the LightX2V / DiffSynth loader) is the documented
+    fallback. The config only states the choice; the loader code lives in i2v.py."""
+    DIFFUSERS = "diffusers"
+    LIGHTX2V = "lightx2v"
+
+
+class FeatureCache(str, Enum):
+    """Final-tier inference cache for the full-step Wan path (a TeaCache successor). Reuses
+    block features across adjacent steps for ~1.5-2x at high step counts. NEVER stack this on
+    the 4-step distill path: at 4 steps there is nothing to cache."""
+    NONE = "none"
+    MIXCACHE = "mixcache"
+    EASYCACHE = "easycache"
+
+
+# ------------------------------------------------------------------ multi-character block
+
+@dataclass
+class MultiCharConfig:
+    """Anti-bleed config for the multi-character keyframe path: the per-slot identity scales
+    and pose conditioning that hold two faces / bodies apart in one frame.
+
+    Defaults mirror `orchestrator.MULTI_CHAR_DEFAULTS` (engine=regional, pose_conditioning=True,
+    lora_scale_per_slot=0.3, ip_adapter_scale_per_slot=0.7, max_slots=2); the InstantID and
+    ControlNet-pose strengths come from the control plane's `face_lock` / pose defaults."""
+    regional: bool = True                     # regional prompting engine (per-slot regions)
+    pose_conditioning: bool = True            # OpenPose ControlNet to separate bodies
+    lora_scale_per_slot: float = 0.3          # 0..2; per-character LoRA strength in a shared frame
+    ip_adapter_scale_per_slot: float = 0.7    # 0..1; per-character IP-Adapter identity pull
+    max_slots: int = 2                        # 1..4; characters the no-bleed path supports at once
+    identity_method: IdentityMethod = IdentityMethod.IP_ADAPTER
+    instantid_controlnet_scale: float = 0.8   # 0..1.5; InstantID face-ControlNet strength
+    instantid_ip_adapter_scale: float = 0.8   # 0..1.5; InstantID IP-Adapter strength
+    controlnet_pose_scale: float = 0.55       # 0..1.5; OpenPose ControlNet conditioning scale
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "MultiCharConfig":
+        d = d or {}
+        base = cls()
+        return cls(
+            regional=bool(d.get("regional", base.regional)),
+            pose_conditioning=bool(d.get("pose_conditioning", base.pose_conditioning)),
+            lora_scale_per_slot=_clamp(d.get("lora_scale_per_slot"), 0.0, 2.0, base.lora_scale_per_slot),
+            ip_adapter_scale_per_slot=_clamp(d.get("ip_adapter_scale_per_slot"), 0.0, 1.0, base.ip_adapter_scale_per_slot),
+            max_slots=_clamp_int(d.get("max_slots"), 1, 4, base.max_slots),
+            identity_method=_enum_or(IdentityMethod, d.get("identity_method"), base.identity_method),
+            instantid_controlnet_scale=_clamp(d.get("instantid_controlnet_scale"), 0.0, 1.5, base.instantid_controlnet_scale),
+            instantid_ip_adapter_scale=_clamp(d.get("instantid_ip_adapter_scale"), 0.0, 1.5, base.instantid_ip_adapter_scale),
+            controlnet_pose_scale=_clamp(d.get("controlnet_pose_scale"), 0.0, 1.5, base.controlnet_pose_scale),
+        )
+
+
+# --------------------------------------------------------------------------- keyframe
+
+@dataclass
+class KeyframeConfig:
+    """SDXL keyframe-stage generation config.
+
+    Fields map to documented diffusers SDXL parameters: `steps` -> num_inference_steps,
+    `guidance_scale` -> CFG, `scheduler` -> the sampler, `width`/`height` -> the generated size,
+    `seed` -> the RNG seed. `distill` toggles the Hyper-SD few-step path (`distill_steps` at
+    cfg=0 on a DDIM-trailing / TCD scheduler). `base_model` defaults to the keyframe SDXL in
+    `models.DEFAULT_SPECS`. `multi_char` carries the anti-bleed identity stack.
+
+    Built tier-aware via `for_tier`: draft = 4-step distilled, final = full-step high-cfg.
+    """
+    base_model: str = field(default_factory=lambda: _model_id(ModelRole.KEYFRAME_BASE))
+    steps: int = 30                  # 1..128; diffusers num_inference_steps (full path)
+    guidance_scale: float = 6.5      # 0..30; CFG. Hyper-SD few-step wants 0.0
+    scheduler: Scheduler = Scheduler.DPMPP_2M_KARRAS
+    width: int = 1024                # 512..2048; SDXL native is 1024
+    height: int = 1024               # 512..2048
+    distill: bool = False            # few-step Hyper-SD path on/off
+    distill_model: str = field(default_factory=lambda: _model_id(ModelRole.KEYFRAME_FEWSTEP))
+    distill_steps: int = 8           # 1..8; Hyper-SD fixed-step LoRA step count
+    seed: int = 424242               # >=0; base RNG seed (control-plane default)
+    multi_char: MultiCharConfig = field(default_factory=MultiCharConfig)
+
+    @classmethod
+    def for_tier(cls, tier: QualityTier) -> "KeyframeConfig":
+        """The keyframe config for a quality tier. Draft and standard ride the Hyper-SD few-step
+        LoRA (cfg=0, DDIM-trailing) to keep keyframes cheap; final drops distillation for a full
+        high-CFG SDXL pass. Keyframes get animated downstream, so even final stays modest."""
+        if tier is QualityTier.DRAFT:
+            return cls(distill=True, distill_steps=4, steps=4, guidance_scale=0.0,
+                       scheduler=Scheduler.DDIM_TRAILING)
+        if tier is QualityTier.STANDARD:
+            return cls(distill=True, distill_steps=8, steps=8, guidance_scale=0.0,
+                       scheduler=Scheduler.DDIM_TRAILING)
+        return cls(distill=False, steps=30, guidance_scale=6.5,
+                   scheduler=Scheduler.DPMPP_2M_KARRAS)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None, *, tier: QualityTier | None = None) -> "KeyframeConfig":
+        """Build from a (forgiving) override dict, layered over the tier baseline. Unknown keys
+        are ignored; numeric knobs are clamped to their documented range. Accepts either explicit
+        `width`/`height` or a `resolution` "WIDTHxHEIGHT" string (the control plane's shape)."""
+        base = cls.for_tier(tier) if tier is not None else cls()
+        d = d or {}
+        w, h = base.width, base.height
+        if isinstance(d.get("resolution"), str) and "x" in d["resolution"]:
+            try:
+                ws, hs = d["resolution"].lower().split("x", 1)
+                w, h = int(ws), int(hs)
+            except ValueError:
+                pass
+        return cls(
+            base_model=str(d.get("base_model", base.base_model)),
+            steps=_clamp_int(d.get("steps"), 1, 128, base.steps),
+            guidance_scale=_clamp(d.get("guidance_scale"), 0.0, 30.0, base.guidance_scale),
+            scheduler=_enum_or(Scheduler, d.get("scheduler"), base.scheduler),
+            width=_clamp_int(d.get("width", w), 512, 2048, base.width),
+            height=_clamp_int(d.get("height", h), 512, 2048, base.height),
+            distill=bool(d.get("distill", base.distill)),
+            distill_model=str(d.get("distill_model", base.distill_model)),
+            distill_steps=_clamp_int(d.get("distill_steps"), 1, 8, base.distill_steps),
+            seed=_clamp_int(d.get("seed"), 0, 2**31 - 1, base.seed),
+            multi_char=MultiCharConfig.from_dict(d.get("multi_char")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# ------------------------------------------------------------------------------- i2v
+
+@dataclass
+class I2VConfig:
+    """Wan 2.2 image-to-video generation config.
+
+    Fields map to documented Wan 2.2 diffusers parameters: `steps` -> num_inference_steps,
+    `guidance_scale` -> CFG, `num_frames` / `fps` -> the clip, `flow_shift` -> the
+    FlowMatch scheduler shift. `distill` toggles the Wan2.2-Lightning 4-step path (CFG off, so
+    `guidance_scale` ~1.0); `loader` selects the LoRA loader (diffusers vs the LightX2V fallback
+    for issue #12535). `feature_cache` is the final-tier full-step accelerator and must stay
+    NONE whenever `distill` is on (nothing to cache at 4 steps). `model` defaults to the i2v
+    spec in `models.DEFAULT_SPECS`.
+
+    Built tier-aware via `for_tier`: draft = Lightning 4-step, final = full 40-step + cache.
+    """
+    model: str = field(default_factory=lambda: _model_id(ModelRole.I2V))
+    num_frames: int = 81             # 1..256; Wan2.2 documented default (5s at 16fps)
+    fps: int = 16                    # 1..120; Wan2.2 export fps
+    steps: int = 40                  # 1..64; Wan2.2 documented num_inference_steps (full)
+    guidance_scale: float = 3.5      # 0..30; Wan2.2 documented CFG (full); distill ~1.0
+    flow_shift: float = 5.0          # 0..20; FlowMatch scheduler shift
+    seconds_per_shot: float = 5.0    # 0.5..60; derives num_frames when a shot has no duration
+    distill: bool = False            # Wan2.2-Lightning 4-step path on/off
+    distill_model: str = field(default_factory=lambda: _model_id(ModelRole.I2V_DISTILL))
+    distill_steps: int = 4           # 1..8; Lightning runs 4
+    loader: I2VLoader = I2VLoader.DIFFUSERS
+    feature_cache: FeatureCache = FeatureCache.NONE
+    negative_prompt: str = ""        # optional; empty = the model's shipped default negative
+
+    @classmethod
+    def for_tier(cls, tier: QualityTier) -> "I2VConfig":
+        """The i2v config for a quality tier. Draft rides Wan2.2-Lightning (4 steps, CFG off, no
+        cache -- nothing to cache at 4 steps); standard runs a reduced full-step pass with the
+        EasyCache accelerator; final runs the full 40-step pass with MixCache (the long pole, the
+        hero quality)."""
+        if tier is QualityTier.DRAFT:
+            return cls(distill=True, distill_steps=4, steps=4, guidance_scale=1.0,
+                       loader=I2VLoader.DIFFUSERS, feature_cache=FeatureCache.NONE)
+        if tier is QualityTier.STANDARD:
+            return cls(distill=False, steps=20, guidance_scale=3.5,
+                       feature_cache=FeatureCache.EASYCACHE)
+        return cls(distill=False, steps=40, guidance_scale=3.5,
+                   feature_cache=FeatureCache.MIXCACHE)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None, *, tier: QualityTier | None = None) -> "I2VConfig":
+        """Build from a (forgiving) override dict over the tier baseline. Unknown keys ignored,
+        numeric knobs clamped. A caching choice is force-cleared to NONE whenever distillation is
+        on, so an override cannot create the invalid 'cache a 4-step render' combination."""
+        base = cls.for_tier(tier) if tier is not None else cls()
+        d = d or {}
+        distill = bool(d.get("distill", base.distill))
+        cache = _enum_or(FeatureCache, d.get("feature_cache"), base.feature_cache)
+        if distill:
+            cache = FeatureCache.NONE
+        return cls(
+            model=str(d.get("model", base.model)),
+            num_frames=_clamp_int(d.get("num_frames"), 1, 256, base.num_frames),
+            fps=_clamp_int(d.get("fps"), 1, 120, base.fps),
+            steps=_clamp_int(d.get("steps"), 1, 64, base.steps),
+            guidance_scale=_clamp(d.get("guidance_scale"), 0.0, 30.0, base.guidance_scale),
+            flow_shift=_clamp(d.get("flow_shift"), 0.0, 20.0, base.flow_shift),
+            seconds_per_shot=_clamp(d.get("seconds_per_shot"), 0.5, 60.0, base.seconds_per_shot),
+            distill=distill,
+            distill_model=str(d.get("distill_model", base.distill_model)),
+            distill_steps=_clamp_int(d.get("distill_steps"), 1, 8, base.distill_steps),
+            loader=_enum_or(I2VLoader, d.get("loader"), base.loader),
+            feature_cache=cache,
+            negative_prompt=str(d.get("negative_prompt", base.negative_prompt)),
+        )
+
+    def frames_for(self, seconds: float | None) -> int:
+        """Frame count for a shot of `seconds` at this fps, clamped to the documented 1..256
+        ceiling; falls back to `num_frames` when no duration is given."""
+        if not seconds or seconds <= 0:
+            return self.num_frames
+        return max(1, min(256, round(seconds * self.fps)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
