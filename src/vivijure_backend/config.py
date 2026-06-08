@@ -84,9 +84,13 @@ class Scheduler(str, Enum):
 
 
 class IdentityMethod(str, Enum):
-    """How a character's face is pinned onto the keyframe. IP-Adapter pulls identity from the
-    reference embedding; InstantID adds a face-ControlNet for stronger structural lock; BOTH
-    stacks them (strongest, slowest). Mirrors the control plane's `face_lock` mode union."""
+    """How a character's face is pinned onto the keyframe. `IP_ADAPTER` (the default for single
+    AND multi-character shots) pulls identity from the reference embedding; in the regional
+    multi-character path it is masked per region (one identity per mask), which is what holds two
+    faces apart. `INSTANTID` is a single-character upgrade for face-critical shots (it adds a
+    face-ControlNet for a stronger structural lock, but is single-face by nature, so it is NOT
+    used on the regional multi-face path). `BOTH` stacks them: an advanced, future option, never
+    a default. Mirrors the control plane's `face_lock` mode union."""
     IP_ADAPTER = "ip_adapter"
     INSTANTID = "instantid"
     BOTH = "both"
@@ -114,20 +118,21 @@ class FeatureCache(str, Enum):
 
 @dataclass
 class MultiCharConfig:
-    """Anti-bleed config for the multi-character keyframe path: the per-slot identity scales
-    and pose conditioning that hold two faces / bodies apart in one frame.
+    """Anti-bleed config for the **regional multi-character path only** (2+ characters in one
+    frame). keyframe.py reads this block solely when `engine_for(scene) == "regional"`; a
+    single-character shot never touches it, which is why the per-slot scales live here and not on
+    `KeyframeConfig`. The identity method itself (IP-Adapter vs InstantID) is a `KeyframeConfig`
+    field because it applies to every shot; here we only carry the per-region masked-IP-Adapter /
+    pose knobs that separate two bodies. InstantID is deliberately absent: it is single-face by
+    nature, so the regional path stays masked-IP-Adapter only.
 
     Defaults mirror `orchestrator.MULTI_CHAR_DEFAULTS` (engine=regional, pose_conditioning=True,
-    lora_scale_per_slot=0.3, ip_adapter_scale_per_slot=0.7, max_slots=2); the InstantID and
-    ControlNet-pose strengths come from the control plane's `face_lock` / pose defaults."""
-    regional: bool = True                     # regional prompting engine (per-slot regions)
+    lora_scale_per_slot=0.3, ip_adapter_scale_per_slot=0.7, max_slots=2)."""
+    regional: bool = True                     # use the regional no-bleed engine for multi-char shots
     pose_conditioning: bool = True            # OpenPose ControlNet to separate bodies
     lora_scale_per_slot: float = 0.3          # 0..2; per-character LoRA strength in a shared frame
-    ip_adapter_scale_per_slot: float = 0.7    # 0..1; per-character IP-Adapter identity pull
+    ip_adapter_scale_per_slot: float = 0.7    # 0..1; per-region masked IP-Adapter identity pull
     max_slots: int = 2                        # 1..4; characters the no-bleed path supports at once
-    identity_method: IdentityMethod = IdentityMethod.IP_ADAPTER
-    instantid_controlnet_scale: float = 0.8   # 0..1.5; InstantID face-ControlNet strength
-    instantid_ip_adapter_scale: float = 0.8   # 0..1.5; InstantID IP-Adapter strength
     controlnet_pose_scale: float = 0.55       # 0..1.5; OpenPose ControlNet conditioning scale
 
     @classmethod
@@ -140,9 +145,6 @@ class MultiCharConfig:
             lora_scale_per_slot=_clamp(d.get("lora_scale_per_slot"), 0.0, 2.0, base.lora_scale_per_slot),
             ip_adapter_scale_per_slot=_clamp(d.get("ip_adapter_scale_per_slot"), 0.0, 1.0, base.ip_adapter_scale_per_slot),
             max_slots=_clamp_int(d.get("max_slots"), 1, 4, base.max_slots),
-            identity_method=_enum_or(IdentityMethod, d.get("identity_method"), base.identity_method),
-            instantid_controlnet_scale=_clamp(d.get("instantid_controlnet_scale"), 0.0, 1.5, base.instantid_controlnet_scale),
-            instantid_ip_adapter_scale=_clamp(d.get("instantid_ip_adapter_scale"), 0.0, 1.5, base.instantid_ip_adapter_scale),
             controlnet_pose_scale=_clamp(d.get("controlnet_pose_scale"), 0.0, 1.5, base.controlnet_pose_scale),
         )
 
@@ -157,7 +159,12 @@ class KeyframeConfig:
     `guidance_scale` -> CFG, `scheduler` -> the sampler, `width`/`height` -> the generated size,
     `seed` -> the RNG seed. `distill` toggles the Hyper-SD few-step path (`distill_steps` at
     cfg=0 on a DDIM-trailing / TCD scheduler). `base_model` defaults to the keyframe SDXL in
-    `models.DEFAULT_SPECS`. `multi_char` carries the anti-bleed identity stack.
+    `models.DEFAULT_SPECS`.
+
+    Identity (applies to every shot): `identity_method` defaults to IP-Adapter; `ip_adapter_scale`
+    is the single-subject identity pull; the `instantid_*` scales apply only when InstantID is
+    selected (a single-character face-critical upgrade). The regional multi-character anti-bleed
+    knobs live in `multi_char`, read only on the regional path.
 
     Built tier-aware via `for_tier`: draft = 4-step distilled, final = full-step high-cfg.
     """
@@ -171,6 +178,11 @@ class KeyframeConfig:
     distill_model: str = field(default_factory=lambda: _model_id(ModelRole.KEYFRAME_FEWSTEP))
     distill_steps: int = 8           # 1..8; Hyper-SD fixed-step LoRA step count
     seed: int = 424242               # >=0; base RNG seed (control-plane default)
+    # Identity stack (all shots). InstantID stays single-char; regional multi-char is masked IP-Adapter.
+    identity_method: IdentityMethod = IdentityMethod.IP_ADAPTER
+    ip_adapter_scale: float = 0.65   # 0..1; single-subject IP-Adapter identity pull (face_lock default)
+    instantid_controlnet_scale: float = 0.8  # 0..1.5; InstantID face-ControlNet (single-char upgrade)
+    instantid_ip_adapter_scale: float = 0.8  # 0..1.5; InstantID IP-Adapter (single-char upgrade)
     multi_char: MultiCharConfig = field(default_factory=MultiCharConfig)
 
     @classmethod
@@ -212,6 +224,10 @@ class KeyframeConfig:
             distill_model=str(d.get("distill_model", base.distill_model)),
             distill_steps=_clamp_int(d.get("distill_steps"), 1, 8, base.distill_steps),
             seed=_clamp_int(d.get("seed"), 0, 2**31 - 1, base.seed),
+            identity_method=_enum_or(IdentityMethod, d.get("identity_method"), base.identity_method),
+            ip_adapter_scale=_clamp(d.get("ip_adapter_scale"), 0.0, 1.0, base.ip_adapter_scale),
+            instantid_controlnet_scale=_clamp(d.get("instantid_controlnet_scale"), 0.0, 1.5, base.instantid_controlnet_scale),
+            instantid_ip_adapter_scale=_clamp(d.get("instantid_ip_adapter_scale"), 0.0, 1.5, base.instantid_ip_adapter_scale),
             multi_char=MultiCharConfig.from_dict(d.get("multi_char")),
         )
 

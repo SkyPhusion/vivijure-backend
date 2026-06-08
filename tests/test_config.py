@@ -108,8 +108,19 @@ def test_distill_forces_cache_off_even_when_overridden():
 def test_enum_parse_is_forgiving():
     v = I2VConfig.from_dict({"loader": "nonsense"})
     assert v.loader is I2VLoader.DIFFUSERS
-    k = KeyframeConfig.from_dict({"multi_char": {"identity_method": "huh"}})
-    assert k.multi_char.identity_method is IdentityMethod.IP_ADAPTER
+    k = KeyframeConfig.from_dict({"identity_method": "huh"})
+    assert k.identity_method is IdentityMethod.IP_ADAPTER
+
+
+def test_identity_method_is_keyframe_level_default_ip_adapter():
+    # Identity applies to single AND multi-char shots, so it lives on KeyframeConfig, not
+    # multi_char. IP-Adapter is the default everywhere; InstantID is a single-char upgrade.
+    assert KeyframeConfig().identity_method is IdentityMethod.IP_ADAPTER
+    k = KeyframeConfig.from_dict({"identity_method": "instantid", "instantid_controlnet_scale": 0.9})
+    assert k.identity_method is IdentityMethod.INSTANTID
+    assert k.instantid_controlnet_scale == 0.9
+    # The regional block carries no identity method (masked IP-Adapter only, no InstantID).
+    assert not hasattr(MultiCharConfig(), "identity_method")
 
 
 # --------------------------------------------------------------------------- derivations
@@ -126,7 +137,8 @@ def test_round_trips_through_to_dict():
     rk = KeyframeConfig.from_dict(k.to_dict())
     assert rk.steps == k.steps
     assert rk.scheduler is k.scheduler                      # enum survives the round-trip
-    assert rk.multi_char.identity_method is k.multi_char.identity_method
+    assert rk.identity_method is k.identity_method
+    assert rk.multi_char.lora_scale_per_slot == k.multi_char.lora_scale_per_slot
     v = I2VConfig.for_tier(QualityTier.FINAL)
     rv = I2VConfig.from_dict(v.to_dict())
     assert rv.feature_cache is v.feature_cache and rv.loader is v.loader
