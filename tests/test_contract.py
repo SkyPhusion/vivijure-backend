@@ -99,6 +99,29 @@ def test_render_request_defaults_and_type_guards():
     assert bad.process_shot_ids is None
 
 
+def test_render_request_builds_typed_config_from_tier_and_overrides():
+    # The typed generation config is parsed from quality_tier + the namespaced render_overrides,
+    # while the raw overrides dict is still kept for routing flags the harness reads.
+    req = RenderRequest.from_dict({
+        "bundle_key": "x",
+        "quality_tier": "draft",
+        "render_overrides": {"keyframe": {"steps": 6}, "i2v": {"num_frames": 49},
+                             "finish_offloaded": True},
+    })
+    assert req.config.quality.value == "draft"
+    assert req.config.keyframe.steps == 6           # override over the draft baseline
+    assert req.config.keyframe.distill is True       # draft tier baseline
+    assert req.config.i2v.num_frames == 49
+    assert req.overrides.get("finish_offloaded") is True   # routing flag preserved on raw dict
+
+
+def test_render_request_default_config_is_a_final_render_config():
+    req = RenderRequest.from_dict({"bundle_key": "x"})  # quality_tier defaults to "final"
+    assert req.config.quality.value == "final"
+    assert req.config.keyframe.distill is False        # final = full-step
+    assert req.config.i2v.steps == 40
+
+
 def test_cast_from_registry_filters_bad_slots():
     cast = Cast.from_registry({"characters": {
         "A": {"name": "Vesper", "prompt": "teal-haired"},

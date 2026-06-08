@@ -55,6 +55,8 @@ def _clamp_int(value: Any, lo: int, hi: int, default: int) -> int:
 def _enum_or(enum_cls, value: Any, default):
     """Parse `value` into `enum_cls`, returning `default` for anything unrecognized. Accepts an
     already-typed member (so `from_dict(to_dict())` round-trips) as well as a wire string."""
+    if value is None:
+        return default  # absent key: keep the baseline (and never collide with a "none" member)
     if isinstance(value, enum_cls):
         return value
     try:
@@ -137,7 +139,7 @@ class MultiCharConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "MultiCharConfig":
-        d = d or {}
+        d = d if isinstance(d, dict) else {}
         base = cls()
         return cls(
             regional=bool(d.get("regional", base.regional)),
@@ -205,7 +207,7 @@ class KeyframeConfig:
         are ignored; numeric knobs are clamped to their documented range. Accepts either explicit
         `width`/`height` or a `resolution` "WIDTHxHEIGHT" string (the control plane's shape)."""
         base = cls.for_tier(tier) if tier is not None else cls()
-        d = d or {}
+        d = d if isinstance(d, dict) else {}
         w, h = base.width, base.height
         if isinstance(d.get("resolution"), str) and "x" in d["resolution"]:
             try:
@@ -286,7 +288,7 @@ class I2VConfig:
         numeric knobs clamped. A caching choice is force-cleared to NONE whenever distillation is
         on, so an override cannot create the invalid 'cache a 4-step render' combination."""
         base = cls.for_tier(tier) if tier is not None else cls()
-        d = d or {}
+        d = d if isinstance(d, dict) else {}
         distill = bool(d.get("distill", base.distill))
         cache = _enum_or(FeatureCache, d.get("feature_cache"), base.feature_cache)
         if distill:
@@ -316,3 +318,88 @@ class I2VConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# ------------------------------------------------------------------------------- LoRA
+
+def _lora_from_dict(d: dict[str, Any] | None):
+    """Parse a LoRA training-config override block into the existing
+    `lora_train.LoraTrainConfig` (the single source of truth for training knobs; not re-derived
+    here). Forgiving + clamped, same as the other sections. The import is deferred to avoid a
+    contract -> config -> lora_train -> contract import cycle."""
+    from .lora_train import LoraTrainConfig  # deferred: lora_train imports contract
+
+    base = LoraTrainConfig()
+    d = d if isinstance(d, dict) else {}
+    return LoraTrainConfig(
+        rank=_clamp_int(d.get("rank"), 1, 128, base.rank),
+        resolution=_clamp_int(d.get("resolution"), 512, 1536, base.resolution),
+        learning_rate=_clamp(d.get("learning_rate"), 1e-6, 1e-2, base.learning_rate),
+        max_steps=_clamp_int(d.get("max_steps"), 1, 5000, base.max_steps),
+        batch_size=_clamp_int(d.get("batch_size"), 1, 8, base.batch_size),
+        gradient_accumulation_steps=_clamp_int(d.get("gradient_accumulation_steps"), 1, 32, base.gradient_accumulation_steps),
+        seed=_clamp_int(d.get("seed"), 0, 2**31 - 1, base.seed),
+        random_flip=bool(d.get("random_flip", base.random_flip)),
+        gradient_checkpointing=bool(d.get("gradient_checkpointing", base.gradient_checkpointing)),
+        caption_template=str(d.get("caption_template", base.caption_template)),
+        save_every=_clamp_int(d.get("save_every"), 0, 5000, base.save_every),
+    )
+
+
+def _default_lora():
+    from .lora_train import LoraTrainConfig
+    return LoraTrainConfig()
+
+
+# ----------------------------------------------------------------------------- top level
+
+@dataclass
+class RenderConfig:
+    """The whole typed generation contract for one render: the quality tier plus the three
+    stage configs. This is the single source of truth both the control plane and the backend
+    build to, replacing the untyped `render_overrides` grab-bag for generation parameters.
+
+    `quality` drives the tier baselines (`KeyframeConfig.for_tier` / `I2VConfig.for_tier`); a
+    `render_overrides` payload then layers explicit knobs over those baselines. The expected
+    payload shape is namespaced -- `{"keyframe": {...}, "i2v": {...}, "lora": {...}}` -- and
+    parsing stays forgiving: unknown keys and unknown sections are ignored, so a newer control
+    plane never breaks an older backend.
+
+    LoRA training is not quality-tier dependent (the adapter is the adapter), so the `lora`
+    section is the same across tiers; it leans on `lora_train.LoraTrainConfig` rather than
+    re-deriving the training knobs.
+    """
+    quality: QualityTier = QualityTier.FINAL
+    keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
+    i2v: I2VConfig = field(default_factory=I2VConfig)
+    lora: Any = field(default_factory=_default_lora)  # lora_train.LoraTrainConfig (deferred type)
+
+    @classmethod
+    def for_tier(cls, tier: QualityTier) -> "RenderConfig":
+        return cls(
+            quality=tier,
+            keyframe=KeyframeConfig.for_tier(tier),
+            i2v=I2VConfig.for_tier(tier),
+            lora=_default_lora(),
+        )
+
+    @classmethod
+    def from_request(cls, quality_tier: object, overrides: dict[str, Any] | None) -> "RenderConfig":
+        """Build the full config from a request's `quality_tier` and `render_overrides`. The tier
+        sets every baseline; the (forgiving) overrides layer explicit knobs over it."""
+        tier = QualityTier.parse(quality_tier)
+        d = overrides if isinstance(overrides, dict) else {}
+        return cls(
+            quality=tier,
+            keyframe=KeyframeConfig.from_dict(d.get("keyframe"), tier=tier),
+            i2v=I2VConfig.from_dict(d.get("i2v"), tier=tier),
+            lora=_lora_from_dict(d.get("lora")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "quality": self.quality.value,
+            "keyframe": self.keyframe.to_dict(),
+            "i2v": self.i2v.to_dict(),
+            "lora": asdict(self.lora),
+        }

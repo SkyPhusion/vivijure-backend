@@ -7,6 +7,7 @@ from vivijure_backend.config import (
     IdentityMethod,
     KeyframeConfig,
     MultiCharConfig,
+    RenderConfig,
     Scheduler,
 )
 from vivijure_backend.models import DEFAULT_SPECS, ModelRole
@@ -142,3 +143,45 @@ def test_round_trips_through_to_dict():
     v = I2VConfig.for_tier(QualityTier.FINAL)
     rv = I2VConfig.from_dict(v.to_dict())
     assert rv.feature_cache is v.feature_cache and rv.loader is v.loader
+
+
+# --------------------------------------------------------------------- RenderConfig (top level)
+
+def test_render_config_for_tier_threads_the_tier_into_every_stage():
+    rc = RenderConfig.for_tier(QualityTier.DRAFT)
+    assert rc.quality is QualityTier.DRAFT
+    assert rc.keyframe.distill and rc.i2v.distill          # draft = distilled everywhere
+    assert rc.lora.rank == 16                              # LoRA is tier-independent
+
+
+def test_render_config_from_request_layers_namespaced_overrides_over_tier():
+    rc = RenderConfig.from_request("final", {
+        "keyframe": {"steps": 25},
+        "i2v": {"guidance_scale": 4.0},
+        "lora": {"rank": 32, "max_steps": 1500},
+    })
+    assert rc.quality is QualityTier.FINAL
+    assert rc.keyframe.steps == 25 and rc.keyframe.distill is False   # final baseline + override
+    assert rc.i2v.guidance_scale == 4.0 and rc.i2v.feature_cache is FeatureCache.MIXCACHE
+    assert rc.lora.rank == 32 and rc.lora.max_steps == 1500
+
+
+def test_render_config_from_request_is_forgiving_about_junk():
+    # No overrides, junk overrides, and unknown sections all fall back to the tier baseline.
+    assert RenderConfig.from_request("draft", None).keyframe.distill_steps == 4
+    rc = RenderConfig.from_request("standard", {"nonsense_section": {"x": 1}, "i2v": "not a dict"})
+    assert rc.quality is QualityTier.STANDARD
+    assert rc.i2v.steps == I2VConfig.for_tier(QualityTier.STANDARD).steps
+
+
+def test_render_config_lora_clamps_out_of_range():
+    rc = RenderConfig.from_request("final", {"lora": {"rank": 9999, "learning_rate": 5.0}})
+    assert rc.lora.rank == 128
+    assert rc.lora.learning_rate == 1e-2
+
+
+def test_render_config_to_dict_is_json_shaped():
+    d = RenderConfig.for_tier(QualityTier.STANDARD).to_dict()
+    assert d["quality"] == "standard"
+    assert set(d) == {"quality", "keyframe", "i2v", "lora"}
+    assert isinstance(d["keyframe"]["scheduler"], str)  # enums flattened to their wire value

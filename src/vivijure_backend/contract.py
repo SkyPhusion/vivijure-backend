@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from .config import RenderConfig
+
 # Character slots. The control plane allocates A..D; the renderer treats them as opaque
 # identifiers for a region / LoRA / ref directory.
 SLOT_IDS = ("A", "B", "C", "D")
@@ -188,26 +190,35 @@ def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
 
 @dataclass
 class RenderRequest:
-    """What the control plane submits. `action` selects the pipeline path; `overrides`
-    is the typed per-job config the control plane uses to retune a render without a
-    rebuild; `pretrained_loras` maps a slot to an already-trained LoRA so its training
-    is skipped."""
+    """What the control plane submits. `action` selects the pipeline path; `config` is the
+    typed generation config (keyframe / i2v / lora) parsed from `render_overrides`, the single
+    source of truth for what drives generation; `pretrained_loras` maps a slot to an
+    already-trained LoRA so its training is skipped.
+
+    `overrides` is kept as the raw `render_overrides` dict for the small set of non-generation
+    *routing* flags the pipeline still reads off it (e.g. `finish_offloaded` for the off-GPU
+    finish path); every actual generation knob now lives typed under `config`."""
     action: str  # "render" | "regen_shot" | "finalize" | "train_lora"
     project: str
     bundle_key: str
     quality_tier: str = "final"
-    overrides: dict[str, Any] = field(default_factory=dict)
+    config: RenderConfig = field(default_factory=RenderConfig)
+    overrides: dict[str, Any] = field(default_factory=dict)  # raw render_overrides; routing flags only
     pretrained_loras: dict[str, str] = field(default_factory=dict)
     process_shot_ids: list[str] | None = None  # finalize / regen subset
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RenderRequest":
+        from .config import RenderConfig
+        overrides = d.get("render_overrides") if isinstance(d.get("render_overrides"), dict) else {}
+        quality_tier = _str(d.get("quality_tier"), "final")
         return cls(
             action=_str(d.get("action"), "render"),
             project=_str(d.get("project"), "untitled"),
             bundle_key=_str(d.get("bundle_key")),
-            quality_tier=_str(d.get("quality_tier"), "final"),
-            overrides=d.get("render_overrides") if isinstance(d.get("render_overrides"), dict) else {},
+            quality_tier=quality_tier,
+            config=RenderConfig.from_request(quality_tier, overrides),
+            overrides=overrides,
             pretrained_loras=d.get("pretrained_loras") if isinstance(d.get("pretrained_loras"), dict) else {},
             process_shot_ids=d.get("process_shot_ids") if isinstance(d.get("process_shot_ids"), list) else None,
         )
