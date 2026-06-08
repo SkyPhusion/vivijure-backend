@@ -67,7 +67,10 @@ class Device:
         return self.arch in (Arch.BLACKWELL, Arch.HOPPER)
 
     def image_quant(self) -> Quant:
-        """SDXL keyframes: 4-bit (SVDQuant/NVFP4) on Blackwell, fp8 on Hopper."""
+        """Card ceiling for a 4-bit-capable image DiT (FLUX / Qwen-Image): NVFP4 on Blackwell,
+        fp8 on Hopper. NOTE: SDXL is a UNet with no 4-bit engine, so it never actually reaches
+        NVFP4; `models.quant_for(family, device)` is the real per-model decision and narrows
+        SDXL to fp8. This stays as the raw card-capability ceiling."""
         if self.supports_fp4:
             return Quant.NVFP4
         if self.supports_fp8:

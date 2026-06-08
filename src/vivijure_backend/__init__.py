@@ -1,4 +1,4 @@
-"""vivijure-render: a clean-room render backend for Vivijure."""
+"""vivijure-backend: a clean-room render backend for Vivijure."""
 from .contract import (
     Bundle,
     Cast,
@@ -11,6 +11,7 @@ from .contract import (
     Storyboard,
 )
 from .device import Arch, Attention, Device, Quant, Tier, current
+from .models import DEFAULT_SPECS, ModelFamily, ModelRole, ModelServer, ModelSpec, quant_for
 from .routing import RUNPOD_GPU_ID, QualityTier, Stage, gpu_for
 
 __all__ = [
@@ -34,4 +35,11 @@ __all__ = [
     "QualityTier",
     "gpu_for",
     "RUNPOD_GPU_ID",
+    # models
+    "ModelServer",
+    "ModelRole",
+    "ModelSpec",
+    "ModelFamily",
+    "quant_for",
+    "DEFAULT_SPECS",
 ]
