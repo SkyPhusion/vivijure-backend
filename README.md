@@ -44,4 +44,8 @@ top; the pipeline modules above expose a clean interface it drives.
 
 ## License
 
-TBD (owner's choice). Nothing here is encumbered by third-party pipeline code.
+[AGPL-3.0-only](LICENSE). A labor of love, given freely: use it, learn from it,
+self-host it, build your own creative visions on it. Run it as a network service and
+the AGPL has you share your changes back, so it stays a commons. It is not for sale,
+and not to be resold as a SaaS. Nothing here is encumbered by third-party pipeline
+code (clean-room reimplementation), so this choice is the author's to make.
