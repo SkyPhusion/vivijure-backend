@@ -134,26 +134,53 @@ class ModelServer:
         return pipe
 
     def i2v_pipeline(self):
-        """Wan 2.2 image-to-video: load the fp8 variant, attach the Lightning distill LoRA for
-        few-step sampling, set the attention backend. Final-tier rendering can drop the distill
-        LoRA and add a feature cache (handled by i2v.py); here we load the warm baseline."""
+        """Wan 2.2 image-to-video: load bf16, quantize the MoE transformers to fp8 with torchao on
+        the cards that support it, attach the Lightning distill LoRA for few-step sampling, set the
+        attention backend. Final-tier rendering toggles the distill LoRA off (handled by i2v.py);
+        here we load the warm baseline."""
         if "i2v" in self._cache:
             return self._cache["i2v"]
+        import os
         import torch
         from diffusers import WanImageToVideoPipeline
 
         spec = self.specs[ModelRole.I2V]
-        dtype = torch.float8_e4m3fn if self.device.supports_fp8 else torch.bfloat16
-        pipe = WanImageToVideoPipeline.from_pretrained(
-            spec.repo_id, torch_dtype=dtype, variant="fp8" if self.device.supports_fp8 else None,
-        )
-        pipe.to("cuda")
-        distill = self.specs[ModelRole.I2V_DISTILL]
-        try:
-            pipe.load_lora_weights(distill.repo_id)  # see #12535; LightX2V is the fallback path
-        except Exception as e:  # noqa: BLE001
-            print(f"i2v distill LoRA load failed ({e}); running full-step. Fallback: LightX2V loader.")
+        # The Wan repo ships only bf16 weights (no fp8 variant), so load bf16 and quantize to fp8
+        # in place with torchao -- the same path as the SDXL keyframe, not a from_pretrained
+        # variant. Wan 2.2 A14B is a ~28B two-expert MoE, too large to hold resident on the tighter
+        # cards (and an 80GB H100, where it OOMs), so CPU-offload the inactive expert below the
+        # big-VRAM tiers; the H200/B200 keep it resident and quantize to fp8 for full speed.
+        pipe = WanImageToVideoPipeline.from_pretrained(spec.repo_id, torch_dtype=torch.bfloat16)
+        offload = bool(self.device.vram_gb) and self.device.vram_gb < 120
+        if not offload:
+            pipe.to("cuda")
+
+        # The distill LoRA must be FUSED before fp8 quant: a LoRA cannot load onto torchao-quantized
+        # linears (#12535 -> TorchaoLoraLinear), so bake it into the base weights here and then
+        # quantize the plain fused model. The few-step distill is the draft/standard speed path; a
+        # final-tier worker sets VJ_I2V_DISTILL=0 to keep full steps.
+        if os.environ.get("VJ_I2V_DISTILL", "1") != "0":
+            distill = self.specs[ModelRole.I2V_DISTILL]
+            try:
+                pipe.load_lora_weights(distill.repo_id, adapter_name="distill")
+                pipe.fuse_lora()
+                pipe.unload_lora_weights()
+            except Exception as e:  # noqa: BLE001
+                print(f"i2v distill LoRA load/fuse failed ({e}); full-step. Fallback: LightX2V loader.")
+
+        use_fp8 = (self.device.supports_fp8 and not offload
+                   and os.environ.get("VJ_I2V_FP8", "1") != "0")
+        if use_fp8:
+            for name in ("transformer", "transformer_2"):  # both MoE experts, after the distill fuse
+                module = getattr(pipe, name, None)
+                if module is not None:
+                    try:
+                        _quantize_fp8(module)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"i2v fp8 quantize of {name} failed ({e}); leaving it bf16.")
         _set_attention(pipe, self.device)
+        if offload:
+            pipe.enable_model_cpu_offload()  # keep only the active expert on the GPU
         self._cache["i2v"] = pipe
         return pipe
 
