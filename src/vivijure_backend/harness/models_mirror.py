@@ -98,7 +98,34 @@ def ensure_models(*, env: dict | None = None, log: Callable[[str], None] = print
     antelope.mkdir(parents=True, exist_ok=True)
     subprocess.run(mirror_cmd(conf, f"r2:{bucket}/models/antelopev2", antelope), check=True)
 
+    # rclone --links stores HF-cache symlinks as `<name>.rclonelink` text files (the link target),
+    # and rclone >= 1.7x does NOT translate them back to real symlinks on download -- it leaves the
+    # marker files in place, so the snapshot dirs end up with `config.json.rclonelink` instead of
+    # `config.json -> ../../blobs/<hash>`, and an HF_HUB_OFFLINE load can't find the file. Rebuild
+    # the symlinks from the markers ourselves so the cache is valid regardless of rclone's version.
+    _reconstruct_symlinks(hf_home, log)
+
     models_root.mkdir(parents=True, exist_ok=True)
     sentinel.write_text("ok\n")
     log("models_mirror: model mirror from R2 complete.")
     return True
+
+
+def _reconstruct_symlinks(root: Path, log: Callable[[str], None]) -> int:
+    """Turn every `*.rclonelink` marker under `root` into the real symlink it describes (its file
+    content is the link target). Idempotent; tolerant of an already-correct cache."""
+    n = 0
+    for marker in root.rglob("*.rclonelink"):
+        target = marker.read_text().strip()
+        link = marker.with_suffix("")  # drop the .rclonelink extension
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(target)
+            marker.unlink()
+            n += 1
+        except OSError as exc:  # noqa: PERF203
+            log(f"models_mirror: could not rebuild symlink {link} -> {target} ({exc})")
+    if n:
+        log(f"models_mirror: rebuilt {n} HF-cache symlinks from .rclonelink markers")
+    return n
