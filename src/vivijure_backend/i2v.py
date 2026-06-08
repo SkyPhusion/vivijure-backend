@@ -184,27 +184,31 @@ def _set_feature_cache(pipe, feature_cache) -> None:
     across shots -- the per-scene-state bug class that bit keyframes in v0.1.4/v0.1.5. So always
     clear any prior cache first, then (re)install a fresh one for the requested mode.
 
-    Mechanism: diffusers `apply_first_block_cache` (FirstBlockCache, the generic TeaCache successor
-    in `diffusers.hooks`). FasterCache / PyramidAttentionBroadcast are NOT wired for
-    WanTransformer3DModel (diffusers #11134), so FBCache is the supported path. NONE bypasses
-    entirely. Best-effort like `_set_distill`: if the cache cannot attach (API / Wan-support
-    mismatch), the shot runs full uncached rather than failing the render. POD-VALIDATE that it
-    actually attaches + speeds up on the fp8-quantized Wan DiT (not just a bf16 dev run), and that a
-    multi-shot render does not degrade shot-to-shot (proves the per-shot reset)."""
+    Mechanism: diffusers FirstBlockCache (the generic TeaCache successor) via the MATCHED
+    `CacheMixin.enable_cache(FirstBlockCacheConfig)` / `disable_cache()` pair. (NOT the standalone
+    `apply_first_block_cache` -- it installs the hooks but does not set the `is_cache_enabled` flag
+    `disable_cache()` checks, so the per-shot reset would silently no-op and rely on re-apply
+    replacing the hooks; the matched pair makes the reset real, which is the per-scene-state bug
+    class that bit keyframes in v0.1.4/v0.1.5.) FasterCache / PyramidAttentionBroadcast are NOT
+    wired for WanTransformer3DModel (diffusers #11134), so FBCache is the supported path. NONE
+    bypasses. Best-effort like `_set_distill`: a cache that cannot attach runs full uncached rather
+    than failing the render. Verified on an H200 (:0.1.9): ~1.8-2x on the full-step Wan i2v."""
     transformer = getattr(pipe, "transformer", None)
     if transformer is None:
         return
+    # Reset: clear the previous shot's cache (matched pair), guarded so it is silent when none is on.
     try:
-        transformer.disable_cache()  # drop the previous shot's cache state (no cross-shot leak)
+        if getattr(transformer, "is_cache_enabled", False):
+            transformer.disable_cache()
     except Exception:
-        pass  # nothing installed yet
+        pass
     if feature_cache is FeatureCache.NONE:
         return
     try:
-        from diffusers.hooks import FirstBlockCacheConfig, apply_first_block_cache
+        from diffusers.hooks import FirstBlockCacheConfig
 
         threshold = _FBCACHE_THRESHOLD.get(feature_cache, 0.20)
-        apply_first_block_cache(transformer, FirstBlockCacheConfig(threshold=threshold))
+        transformer.enable_cache(FirstBlockCacheConfig(threshold=threshold))
     except Exception as e:  # noqa: BLE001
         print(f"i2v feature cache {getattr(feature_cache, 'value', feature_cache)} not applied "
               f"({e}); running full uncached.", flush=True)

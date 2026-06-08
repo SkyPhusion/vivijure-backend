@@ -20,10 +20,17 @@ from vivijure_backend.routing import QualityTier
 # ----------------------------------------------------------- feature cache install (item L)
 
 class _FakeTransformer:
+    """Mimics diffusers CacheMixin: enable_cache sets the flag, disable_cache clears it."""
     def __init__(self):
         self.disabled = 0
+        self.enabled = []                 # thresholds passed to enable_cache, in order
+        self.is_cache_enabled = False
+    def enable_cache(self, config):
+        self.enabled.append(config.threshold)
+        self.is_cache_enabled = True
     def disable_cache(self):
         self.disabled += 1
+        self.is_cache_enabled = False
 
 
 class _FakePipe:
@@ -31,7 +38,7 @@ class _FakePipe:
         self.transformer = _FakeTransformer()
 
 
-def _fake_diffusers_hooks(monkeypatch, applied):
+def _fake_diffusers_hooks(monkeypatch):
     import sys, types
     diffusers = types.ModuleType("diffusers")
     hooks = types.ModuleType("diffusers.hooks")
@@ -40,46 +47,60 @@ def _fake_diffusers_hooks(monkeypatch, applied):
         def __init__(self, threshold):
             self.threshold = threshold
 
-    def apply_first_block_cache(transformer, config):
-        applied["transformer"] = transformer
-        applied["threshold"] = config.threshold
-
     hooks.FirstBlockCacheConfig = FirstBlockCacheConfig
-    hooks.apply_first_block_cache = apply_first_block_cache
     diffusers.hooks = hooks
     monkeypatch.setitem(sys.modules, "diffusers", diffusers)
     monkeypatch.setitem(sys.modules, "diffusers.hooks", hooks)
 
 
-def test_feature_cache_none_resets_but_installs_nothing():
-    pipe = _FakePipe()
-    _set_feature_cache(pipe, FeatureCache.NONE)
-    assert pipe.transformer.disabled == 1            # always reset the prior shot's cache state
-
-
-def test_feature_cache_mixcache_installs_fbcache_with_final_threshold(monkeypatch):
-    applied = {}
-    _fake_diffusers_hooks(monkeypatch, applied)
+def test_feature_cache_mixcache_enables_fbcache_with_final_threshold(monkeypatch):
+    _fake_diffusers_hooks(monkeypatch)
     pipe = _FakePipe()
     _set_feature_cache(pipe, FeatureCache.MIXCACHE)
-    assert pipe.transformer.disabled == 1            # reset BEFORE install (no cross-shot leak)
-    assert applied["transformer"] is pipe.transformer
-    assert applied["threshold"] == 0.20              # final tier threshold
+    assert pipe.transformer.enabled == [0.20]        # final tier threshold via enable_cache
+    assert pipe.transformer.is_cache_enabled is True
+    assert pipe.transformer.disabled == 0            # nothing to reset on the first shot (silent)
 
 
 def test_feature_cache_easycache_uses_a_more_conservative_threshold(monkeypatch):
-    applied = {}
-    _fake_diffusers_hooks(monkeypatch, applied)
-    _set_feature_cache(_FakePipe(), FeatureCache.EASYCACHE)
-    assert applied["threshold"] == 0.10
+    _fake_diffusers_hooks(monkeypatch)
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.EASYCACHE)
+    assert pipe.transformer.enabled == [0.10]
+
+
+def test_feature_cache_per_shot_reset_disables_prior_before_re_enabling(monkeypatch):
+    # The matched pair: shot 2 must clear shot 1's cache before installing its own (no leak).
+    _fake_diffusers_hooks(monkeypatch)
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)   # shot 1
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)   # shot 2
+    assert pipe.transformer.disabled == 1            # shot 1's cache was disabled before shot 2's
+    assert pipe.transformer.enabled == [0.20, 0.20]
+    assert pipe.transformer.is_cache_enabled is True
+
+
+def test_feature_cache_none_clears_a_prior_cache(monkeypatch):
+    _fake_diffusers_hooks(monkeypatch)
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)   # enable
+    _set_feature_cache(pipe, FeatureCache.NONE)       # then a NONE shot must turn it off
+    assert pipe.transformer.disabled == 1
+    assert pipe.transformer.is_cache_enabled is False
+
+
+def test_feature_cache_none_on_a_fresh_pipe_is_silent():
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.NONE)
+    assert pipe.transformer.disabled == 0            # no cache on -> no "nothing to disable" noise
 
 
 def test_feature_cache_is_best_effort_when_the_cache_cannot_attach():
-    # No diffusers in the test venv -> the apply import raises; must be swallowed (run uncached),
-    # and the per-shot reset must still have fired.
+    # No diffusers in the test venv -> the FirstBlockCacheConfig import raises; must be swallowed
+    # (run uncached) and never reach enable_cache.
     pipe = _FakePipe()
     _set_feature_cache(pipe, FeatureCache.MIXCACHE)   # must not raise
-    assert pipe.transformer.disabled == 1
+    assert pipe.transformer.enabled == []
 
 
 def test_feature_cache_tolerates_a_pipe_without_a_transformer():
