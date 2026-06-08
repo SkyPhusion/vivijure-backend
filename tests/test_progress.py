@@ -245,3 +245,41 @@ def test_run_job_records_error_event_then_reraises(tmp_path):
                 store=store, workdir=tmp_path / "work", job_id="job-err")
     snap = json.loads(store.objects["renders/neon/progress/job-err.json"])
     assert snap["status"] == "error" and "gpu exploded" in snap["error"]["message"]
+
+
+# ----------------------------------------------- pre-render gate failures (handler())
+
+def test_handler_writes_mirror_error_snapshot_before_reraising(monkeypatch):
+    import pytest
+    from vivijure_backend.harness import handler as H, models_mirror, r2, pipeline_registry
+
+    store = RecordingStore()
+    monkeypatch.setattr(r2.R2Config, "from_env", lambda *a, **k: object())
+    monkeypatch.setattr(r2, "R2", lambda cfg=None: store)
+    monkeypatch.setattr(models_mirror, "ensure_models",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rclone is not installed")))
+    monkeypatch.setattr(pipeline_registry, "get_pipeline", lambda: None)
+
+    # The cold-start mirror fails BEFORE run_job's emitter would exist; the channel must still
+    # record it. The render failure still propagates.
+    with pytest.raises(RuntimeError, match="rclone is not installed"):
+        H.handler({"input": {"project": "neon rain"}, "id": "job-mir"})
+
+    snap = json.loads(store.objects["renders/neon_rain/progress/job-mir.json"])
+    assert snap["status"] == "error"
+    assert snap["error"]["stage"] == "mirror"
+    assert "rclone" in snap["error"]["message"]
+
+
+def test_handler_config_failure_surfaces_to_stdout_and_reraises(monkeypatch, capsys):
+    import pytest
+    from vivijure_backend.harness import handler as H, r2
+
+    # A bad R2 config cannot be recorded TO R2 (R2 is the failure), so it degrades to stdout +
+    # the RunPod hook, and still re-raises rather than running a render against no store.
+    monkeypatch.setattr(r2.R2Config, "from_env",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("R2 config incomplete; missing env: R2_BUCKET")))
+    with pytest.raises(RuntimeError, match="R2 config incomplete"):
+        H.handler({"input": {"project": "neon"}, "id": "job-cfg"})
+    out = capsys.readouterr().out
+    assert "@event error" in out and '"stage":"config"' in out

@@ -175,20 +175,38 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
 def handler(job: dict) -> dict:
     """RunPod serverless entry point. Mirrors models on a cold worker, builds the live R2
     client, runs the job through the deployed GPU pipeline, returns the response. RunPod passes
-    `{"input": {...}}`; the render request is the inner dict."""
+    `{"input": {...}}`; the render request is the inner dict.
+
+    The R2 client and the cold-start model mirror both run BEFORE run_job's own emitter exists,
+    yet a failure there (a broken mirror / missing weight, the exact class the channel must
+    surface) is the most opaque kind. So build the store first and wrap each gate with an emitter
+    that writes an `error` snapshot before re-raising. A bad R2 config is the one failure we cannot
+    record to R2 (R2 is the failure), so it degrades to stdout + the RunPod hook."""
     import tempfile
 
     from .models_mirror import ensure_models
     from .r2 import R2, R2Config
     from .pipeline_registry import get_pipeline  # the deploy registers its GPU pipeline here
 
-    mirrored = ensure_models()
-    store = R2(R2Config.from_env())
     payload = job.get("input", job)
+    project = str(payload.get("project") or "untitled")
+    job_id = str(job.get("id") or "unknown")
+    on_progress = _runpod_progress_hook(job)
+
+    try:
+        store = R2(R2Config.from_env())
+    except Exception as e:
+        ProgressEmitter(None, project, job_id, on_progress=on_progress).error("config", e)
+        raise
+    try:
+        mirrored = ensure_models()
+    except Exception as e:
+        ProgressEmitter(store, project, job_id, on_progress=on_progress).error("mirror", e)
+        raise
+
     workdir = Path(tempfile.mkdtemp(prefix="vj-job-"))
     return run_job(payload, pipeline=get_pipeline(), store=store, workdir=workdir,
-                   job_id=str(job.get("id") or "unknown"), mirrored=bool(mirrored),
-                   on_progress=_runpod_progress_hook(job))
+                   job_id=job_id, mirrored=bool(mirrored), on_progress=on_progress)
 
 
 def _runpod_progress_hook(job: dict):
