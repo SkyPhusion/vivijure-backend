@@ -12,6 +12,7 @@ from .contract import (
 )
 from .device import Arch, Attention, Device, Quant, Tier, current
 from .models import DEFAULT_SPECS, ModelFamily, ModelRole, ModelServer, ModelSpec, quant_for
+from .orchestrator import Action, KeyframeMode, LoraPlan, RenderPlan, ScenePlan, plan, validate
 from .routing import RUNPOD_GPU_ID, QualityTier, Stage, gpu_for
 
 __all__ = [
@@ -42,4 +43,12 @@ __all__ = [
     "ModelFamily",
     "quant_for",
     "DEFAULT_SPECS",
+    # orchestrator (CPU planning)
+    "plan",
+    "validate",
+    "RenderPlan",
+    "ScenePlan",
+    "LoraPlan",
+    "Action",
+    "KeyframeMode",
 ]
