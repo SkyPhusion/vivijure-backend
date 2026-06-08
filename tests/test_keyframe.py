@@ -6,6 +6,7 @@ from vivijure_backend.keyframe import (
     DEFAULT_IP_ADAPTER_SCALE,
     DEFAULT_LORA_SCALE,
     KeyframeParams,
+    _bind_loras,
     build_prompt,
     engine_for,
     region_boxes,
@@ -97,3 +98,54 @@ def test_anti_bleed_defaults():
     assert p.ip_adapter_scale == DEFAULT_IP_ADAPTER_SCALE == 0.7
     assert p.pose_conditioning is True
     assert p.max_slots == 2
+
+
+# ------------------------------------------------------------------- LoRA binding (shared pipe)
+
+class _FakePipe:
+    """Minimal stand-in for the SDXL pipeline's peft surface. `load_lora_weights` rejects a
+    duplicate adapter name the way diffusers/peft does, so a test that re-binds a slot across
+    scenes fails exactly as the real worker did until _bind_loras cleared the prior scene."""
+    def __init__(self, preloaded=()):  # preloaded = persistent base adapters (e.g. a distill LoRA)
+        self.adapters = list(preloaded)
+        self.active = None
+
+    def load_lora_weights(self, path, adapter_name):
+        if adapter_name in self.adapters:
+            raise ValueError(f"Adapter name {adapter_name} already in use in the model - "
+                             "please select a new adapter name.")
+        self.adapters.append(adapter_name)
+
+    def get_list_adapters(self):
+        return {"unet": list(self.adapters)}
+
+    def delete_adapters(self, names):
+        self.adapters = [a for a in self.adapters if a not in names]
+
+    def set_adapters(self, names, adapter_weights):
+        self.active = list(zip(names, adapter_weights))
+
+
+def test_bind_loras_reuses_slot_across_scenes_on_shared_pipe():
+    # The keyframe pipe is process-global; scene 2 must be able to bind "A" again without the
+    # "Adapter name A already in use" crash that failed the first deployed multi-scene render.
+    pipe = _FakePipe()
+    _bind_loras(pipe, {"A": "a.safetensors", "B": "b.safetensors"}, 0.3)
+    _bind_loras(pipe, {"A": "a.safetensors"}, 0.3)  # next scene, slot A again -> no raise
+    assert pipe.adapters == ["A"]                   # B from the prior scene was cleared
+    assert pipe.active == [("A", 0.3)]
+
+
+def test_bind_loras_keeps_base_distill_adapter_across_scenes():
+    pipe = _FakePipe(preloaded=["distill"])         # a persistent base adapter
+    _bind_loras(pipe, {"A": "a.safetensors"}, 0.3)
+    _bind_loras(pipe, {"B": "b.safetensors"}, 0.3)  # different slot, new scene
+    assert pipe.adapters == ["distill", "B"]         # base stays, A (prior scene) is gone
+    assert pipe.active == [("distill", 1.0), ("B", 0.3)]
+
+
+def test_bind_loras_clears_identity_for_a_no_character_scene():
+    pipe = _FakePipe()
+    _bind_loras(pipe, {"A": "a.safetensors"}, 0.3)
+    _bind_loras(pipe, {}, 0.3)                        # a scene with no character
+    assert pipe.adapters == []                        # prior identity does not leak in

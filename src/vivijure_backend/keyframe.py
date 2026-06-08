@@ -217,8 +217,19 @@ def _bind_loras(pipe, slot_paths: dict, scale: float) -> list[str]:
     on the pipe (a few-step distill LoRA, if the ModelServer loaded one). Character LoRAs go on at
     the moderate per-slot `scale` (the anti-bleed weight); any pre-existing base adapter stays at
     1.0. Discovering the base adapter instead of hardcoding a name means this is correct whether or
-    not a distill LoRA is present, and a missing one never silently drops the character identity."""
-    base = _adapter_names(pipe)  # adapters already on the pipe before we add characters
+    not a distill LoRA is present, and a missing one never silently drops the character identity.
+
+    The keyframe pipeline is a process-global shared across every scene on a warm worker, so the
+    previous scene's character adapters are still attached on entry. Record the true base adapters
+    once (whatever is present before any character is bound), then drop the prior scene's character
+    adapters before rebinding; otherwise peft rejects the duplicate name ("Adapter name A already
+    in use"). Clearing them also stops a no-character scene inheriting the last scene's identity."""
+    if not hasattr(pipe, "_vj_base_adapters"):
+        pipe._vj_base_adapters = _adapter_names(pipe)
+    base = pipe._vj_base_adapters  # persistent adapters (e.g. a distill LoRA); never a character
+    stale = [n for n in _adapter_names(pipe) if n not in base]
+    if stale:
+        pipe.delete_adapters(stale)
     loaded = []
     for slot, path in slot_paths.items():
         pipe.load_lora_weights(str(path), adapter_name=slot)
