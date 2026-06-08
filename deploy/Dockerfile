@@ -36,7 +36,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # System deps: ffmpeg for the off-GPU finish + Wan video export, git/build basics, the libs
 # OpenCV / insightface (InstantID) need at import.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates ffmpeg libgl1 libglib2.0-0 build-essential \
+        git curl ca-certificates unzip ffmpeg libgl1 libglib2.0-0 build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # rclone for the R2 model mirror (ensure_models). The distro package is old; the --links

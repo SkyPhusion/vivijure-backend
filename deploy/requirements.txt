@@ -27,13 +27,14 @@ numpy==2.3.5
 Pillow==12.0.0
 PyYAML>=6.0               # contract.py storyboard parse (no version sensitivity)
 
-# --- identity stack (InstantID single-char upgrade) : PROVISIONAL FLOORS, not yet render-exercised ---
-# The validated renders used the masked IP-Adapter identity path; the InstantID upgrade has not
-# been run on a pod, so these stay floors until that path is validated.
-insightface>=0.7
-onnxruntime-gpu>=1.20
-sentencepiece>=0.2
-protobuf>=4.25
+# --- identity stack (InstantID single-char upgrade) : NOT in v0.1.0 ---
+# The validated render paths use the masked IP-Adapter identity, not InstantID, so these are left
+# out of the image until the InstantID path is actually validated on a pod (insightface also
+# compiles from source, a needless build risk for an unused path). Add back here when validated:
+#   insightface>=0.7
+#   onnxruntime-gpu>=1.20
+# sentencepiece / protobuf are likewise unneeded by the SDXL + Wan stack (transformers ran without
+# them in the validated env); add only if a future tokenizer requires them.
 
 # --- serverless SDK + R2 object I/O : floors (import-validated, not render-exercised) ---
 runpod>=1.6
