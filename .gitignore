@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# envs
+.venv/
+venv/
+.env
+*.env
+
+# model weights / caches (never commit)
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+models/
+hf-cache/
+.cache/
+
+# os / editor
+.DS_Store
+*.swp

@@ -1,0 +1,258 @@
+"""The contract between the Vivijure control plane and this render backend.
+
+Everything the backend reads (the storyboard, the cast, the render-job request) and
+everything it returns (keyframes, clips, the final video, trained-LoRA ids, state) is
+typed here. These shapes mirror the control plane's own storyboard schema and render-job
+API; they are a data contract, not borrowed implementation.
+
+Parsing is deliberately forgiving: unknown keys are ignored, and only the fields the
+renderer actually consumes are surfaced, so the control plane can add authored fields
+without breaking an older backend.
+"""
+from __future__ import annotations
+
+import json
+import tarfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+# Character slots. The control plane allocates A..D; the renderer treats them as opaque
+# identifiers for a region / LoRA / ref directory.
+SLOT_IDS = ("A", "B", "C", "D")
+
+
+def _num(v: Any) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _str(v: Any, default: str = "") -> str:
+    return v if isinstance(v, str) else default
+
+
+# --------------------------------------------------------------------------- storyboard
+
+@dataclass
+class Scene:
+    """One shot. Only `prompt` is required; the rest are authored hints."""
+    prompt: str
+    id: str | None = None
+    character_slots: list[str] = field(default_factory=list)
+    start: float | None = None
+    end: float | None = None
+    target_seconds: float | None = None
+    act: str | None = None
+    start_image: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any], index: int) -> "Scene":
+        slots = [s for s in (d.get("character_slots") or []) if s in SLOT_IDS]
+        return cls(
+            prompt=_str(d.get("prompt")),
+            id=_str(d.get("id")) or f"shot_{index + 1:02d}",
+            character_slots=slots,
+            start=_num(d.get("start")),
+            end=_num(d.get("end")),
+            target_seconds=_num(d.get("target_seconds")),
+            act=(_str(d["act"]) or None) if "act" in d else None,
+            start_image=(_str(d["start_image"]) or None) if "start_image" in d else None,
+        )
+
+    @property
+    def is_multi_character(self) -> bool:
+        return len(self.character_slots) >= 2
+
+
+@dataclass
+class Storyboard:
+    """The validated storyboard.json. `title` and `scenes` are the load-bearing fields;
+    the style block is applied uniformly to every scene's prompt."""
+    title: str
+    scenes: list[Scene]
+    full_prompt: str = ""
+    duration_seconds: float | None = None
+    clip_seconds: float | None = None
+    style_prefix: str = ""
+    style_category: str = "None"
+    style_preset: str = "None"
+    use_characters: list[str] = field(default_factory=list)
+    cast_rules: str = ""
+    refs_dir: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Storyboard":
+        scenes = [Scene.from_dict(s, i) for i, s in enumerate(d.get("scenes") or []) if isinstance(s, dict)]
+        if not scenes:
+            raise ValueError("storyboard.json has no scenes")
+        use_chars = [s for s in (d.get("use_characters") or []) if s in SLOT_IDS]
+        # style_category / style_preset normalize to the literal "None" when absent, so a
+        # downstream "is it None?" check tests the string, never a null.
+        cat = _str(d.get("style_category")).strip() or "None"
+        preset = _str(d.get("style_preset")).strip() or "None"
+        return cls(
+            title=_str(d.get("title"), "untitled"),
+            scenes=scenes,
+            full_prompt=_str(d.get("full_prompt")),
+            duration_seconds=_num(d.get("duration_seconds")),
+            clip_seconds=_num(d.get("clip_seconds")),
+            style_prefix=_str(d.get("style_prefix")),
+            style_category=cat,
+            style_preset=preset,
+            use_characters=use_chars,
+            cast_rules=_str(d.get("cast_rules")),
+            refs_dir=(_str(d["refs_dir"]) or None) if "refs_dir" in d else None,
+        )
+
+    @classmethod
+    def from_yaml(cls, text: str) -> "Storyboard":
+        # The bundle ships storyboard.yaml. YAML is a superset of JSON, so this also
+        # accepts a storyboard.json verbatim.
+        return cls.from_dict(yaml.safe_load(text) or {})
+
+    @classmethod
+    def from_json(cls, text: str) -> "Storyboard":
+        return cls.from_dict(json.loads(text))
+
+
+# --------------------------------------------------------------------------------- cast
+
+@dataclass
+class Character:
+    slot: str
+    name: str
+    prompt: str
+    ref_paths: list[Path] = field(default_factory=list)  # training / IP-Adapter references
+
+
+@dataclass
+class Cast:
+    characters: dict[str, Character]  # slot -> Character
+
+    @classmethod
+    def from_registry(cls, registry: dict[str, Any]) -> "Cast":
+        raw = registry.get("characters") or {}
+        out: dict[str, Character] = {}
+        for slot, c in raw.items():
+            if slot not in SLOT_IDS or not isinstance(c, dict):
+                continue
+            out[slot] = Character(slot=slot, name=_str(c.get("name"), slot), prompt=_str(c.get("prompt")))
+        return cls(characters=out)
+
+
+# ------------------------------------------------------------------------------- bundle
+
+@dataclass
+class Bundle:
+    """An extracted project bundle: the storyboard, the cast (with resolved ref paths),
+    and the root the renderer writes its working tree under."""
+    root: Path
+    storyboard: Storyboard
+    cast: Cast
+
+    @classmethod
+    def extract(cls, tar_path: Path, dest: Path) -> "Bundle":
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tar_path, "r:gz") as tf:
+            _safe_extract(tf, dest)
+
+        sb_path = dest / "storyboard.yaml"
+        if not sb_path.is_file():
+            raise FileNotFoundError(f"bundle is missing storyboard.yaml at {sb_path}")
+        storyboard = Storyboard.from_yaml(sb_path.read_text(encoding="utf-8"))
+
+        reg_path = dest / "characters" / "registry.json"
+        cast = Cast.from_registry(json.loads(reg_path.read_text(encoding="utf-8")) if reg_path.is_file() else {})
+
+        refs_root = dest / (storyboard.refs_dir or "characters/refs")
+        for slot, char in cast.characters.items():
+            slot_dir = refs_root / slot
+            if slot_dir.is_dir():
+                char.ref_paths = sorted(p for p in slot_dir.iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
+
+        return cls(root=dest, storyboard=storyboard, cast=cast)
+
+
+def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
+    """Reject path traversal before extracting an untrusted tar."""
+    dest = dest.resolve()
+    for member in tf.getmembers():
+        target = (dest / member.name).resolve()
+        if not str(target).startswith(str(dest)):
+            raise ValueError(f"unsafe path in bundle: {member.name}")
+    tf.extractall(dest)
+
+
+# --------------------------------------------------------------------------- render job
+
+@dataclass
+class RenderRequest:
+    """What the control plane submits. `action` selects the pipeline path; `overrides`
+    is the typed per-job config the control plane uses to retune a render without a
+    rebuild; `pretrained_loras` maps a slot to an already-trained LoRA so its training
+    is skipped."""
+    action: str  # "render" | "regen_shot" | "finalize" | "train_lora"
+    project: str
+    bundle_key: str
+    quality_tier: str = "final"
+    overrides: dict[str, Any] = field(default_factory=dict)
+    pretrained_loras: dict[str, str] = field(default_factory=dict)
+    process_shot_ids: list[str] | None = None  # finalize / regen subset
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RenderRequest":
+        return cls(
+            action=_str(d.get("action"), "render"),
+            project=_str(d.get("project"), "untitled"),
+            bundle_key=_str(d.get("bundle_key")),
+            quality_tier=_str(d.get("quality_tier"), "final"),
+            overrides=d.get("render_overrides") if isinstance(d.get("render_overrides"), dict) else {},
+            pretrained_loras=d.get("pretrained_loras") if isinstance(d.get("pretrained_loras"), dict) else {},
+            process_shot_ids=d.get("process_shot_ids") if isinstance(d.get("process_shot_ids"), list) else None,
+        )
+
+
+@dataclass
+class Keyframe:
+    shot_id: str
+    key: str  # object-store key of the PNG
+
+
+@dataclass
+class Clip:
+    shot_id: str
+    key: str
+    target_seconds: float | None = None
+
+
+@dataclass
+class RenderResult:
+    """What the backend returns. The control plane polls for `output_key` (the final
+    MP4) plus the per-shot `keyframes` and `clips`; `state_key` is the project tree it
+    restores on the next render of this project."""
+    project: str
+    output_key: str | None = None
+    seconds: float | None = None
+    has_audio: bool = False
+    keyframes: list[Keyframe] = field(default_factory=list)
+    clips: list[Clip] = field(default_factory=list)
+    lora: dict[str, Any] = field(default_factory=dict)  # slot -> {lora_id}
+    state_key: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "project": self.project,
+            "output_key": self.output_key,
+            "seconds": self.seconds,
+            "has_audio": self.has_audio,
+            "keyframes": [{"shot_id": k.shot_id, "key": k.key} for k in self.keyframes],
+            "lora": self.lora,
+            "state_key": self.state_key,
+        }
+        if self.clips:
+            out["clips"] = [
+                {"shot_id": c.shot_id, "key": c.key, **({"target_seconds": c.target_seconds} if c.target_seconds else {})}
+                for c in self.clips
+            ]
+        return out
