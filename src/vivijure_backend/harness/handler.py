@@ -95,8 +95,16 @@ def run_job(
             existing_keyframes=set(existing_keyframes),
         )
 
+        # --- stage reused LoRAs from R2 (the harness owns R2; the GPU layer never touches it) ---
+        # The plan skipped training for these slots; their adapters live as R2 keys, so pull each
+        # to local disk before keyframing and hand the local-path map to the pipeline. Fail-fast
+        # (before any GPU work) if a requested adapter cannot be fetched, rather than silently
+        # rendering the character without its identity LoRA.
+        staged = _stage_pretrained_loras(req, store, workdir, progress)
+
         # --- GPU stages (only what the plan kept) ---
         _inject_progress(pipeline, progress)
+        _inject_pretrained_loras(pipeline, staged)
         outputs = pipeline.execute(plan, bundle, workdir)
 
         # --- finish + results out ---
@@ -116,6 +124,43 @@ def _inject_progress(pipeline, progress) -> None:
     if callable(setter):
         try:
             setter(progress)
+        except Exception:
+            pass
+
+
+def _stage_pretrained_loras(req: RenderRequest, store, workdir: Path, progress) -> dict[str, str]:
+    """Download each reused-LoRA R2 key to a local file so the GPU pipeline can load it without
+    touching R2. Returns slot -> local path.
+
+    A ref that is already a local file (a pre-staged deploy, or a test) is taken as-is. A ref the
+    store cannot serve is a hard error (HarnessError): the plan already skipped training that slot,
+    so rendering on without its adapter would silently produce the wrong identity, and that is
+    worse than failing the job here, cheaply, before any GPU work. (R2 transient failures are the
+    store's own retry concern.)"""
+    staged: dict[str, str] = {}
+    for slot, ref in req.pretrained_loras.items():
+        if Path(ref).is_file():
+            staged[slot] = str(ref)
+            continue
+        dest = workdir / "pretrained" / slot / (Path(ref).name or "pytorch_lora_weights.safetensors")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            store.get_file(ref, dest)
+        except Exception as e:
+            raise HarnessError(f"could not stage pretrained LoRA for slot {slot} from {ref!r}: {e}")
+        staged[slot] = str(dest)
+        progress.emit("lora_staged", slot=slot, key=ref)
+    return staged
+
+
+def _inject_pretrained_loras(pipeline, staged: dict[str, str]) -> None:
+    """Hand the local-path adapter map to a pipeline that stages reused LoRAs (GpuPipeline),
+    duck-typed like `_inject_progress` so the protocol and the test fakes stay unchanged. The
+    pipeline's own `if path.is_file()` check then picks them up (they are now local). Best-effort."""
+    setter = getattr(pipeline, "set_pretrained_loras", None)
+    if callable(setter):
+        try:
+            setter(staged)
         except Exception:
             pass
 

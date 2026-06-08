@@ -192,3 +192,62 @@ def test_run_job_drives_gpu_pipeline_offloaded(tmp_path):
     assert {k["shot_id"] for k in res["keyframes"]} == {"shot_01", "shot_02"}
     assert any(k.endswith("manifest.json") for k in store.puts)
     assert res["state_key"] == "projects/neon/state.tar.gz"
+
+
+# ----------------------------------------------------- pretrained-LoRA R2 staging (item B)
+
+class StagingStore(FakeStore):
+    """FakeStore that records the keys it serves, so a test can assert a LoRA was fetched."""
+    def __init__(self, bundle_tar):
+        super().__init__(bundle_tar); self.gets: list[str] = []
+
+    def get_file(self, key, dest):
+        self.gets.append(key)
+        return super().get_file(key, dest)
+
+
+def test_run_job_stages_pretrained_lora_from_r2_and_skips_training(tmp_path):
+    # A render that reuses a slot's R2 LoRA must NOT retrain it, and the adapter must be pulled
+    # to local disk (the GPU layer never touches R2) and fed to keyframing.
+    _extract_bundle(tmp_path)
+    store = StagingStore(tmp_path / "b.tar.gz")
+    LORA_KEY = "loras/neon/A/pytorch_lora_weights.safetensors"
+    pipe = StubPipeline(RenderConfig.for_tier(QualityTier.DRAFT), pretrained_loras={"A": LORA_KEY})
+
+    res = run_job(
+        {"action": "render", "project": "neon", "bundle_key": "bundles/neon.tar.gz",
+         "quality_tier": "draft", "pretrained_loras": {"A": LORA_KEY},
+         "render_overrides": {"finish_offloaded": True}},  # skip the ffmpeg merge of stub clips
+        pipeline=pipe, store=store, workdir=tmp_path / "work", job_id="j")
+
+    assert pipe.trained == ["B"]                              # A reused -> only B trains
+    assert LORA_KEY in store.gets                             # the adapter was actually fetched
+    # the pipeline now holds a LOCAL staged path for A, not the R2 key, and it exists on disk
+    assert "/pretrained/A/" in pipe.pretrained_loras["A"]
+    assert Path(pipe.pretrained_loras["A"]).is_file()
+    assert "A" in pipe.keyframe_loras["shot_01"]              # the staged LoRA reached keyframing
+    assert res["lora"]["A"]["lora_id"] == LORA_KEY            # result still reports the durable R2 key
+
+
+def test_run_job_fails_fast_when_a_reused_lora_cannot_be_staged(tmp_path):
+    # A requested-but-unfetchable LoRA must fail the job BEFORE any GPU work, not silently render
+    # the character without its identity.
+    import pytest
+    from vivijure_backend.harness.handler import HarnessError
+
+    _extract_bundle(tmp_path)
+
+    class MissingLoraStore(FakeStore):
+        def get_file(self, key, dest):
+            if str(key).endswith(".tar.gz"):
+                return super().get_file(key, dest)
+            raise FileNotFoundError(key)                      # the LoRA key is not in R2
+
+    pipe = StubPipeline(RenderConfig.for_tier(QualityTier.DRAFT),
+                        pretrained_loras={"A": "loras/x/A.safetensors"})
+    with pytest.raises(HarnessError, match="could not stage pretrained LoRA"):
+        run_job({"action": "render", "project": "neon", "bundle_key": "bundles/neon.tar.gz",
+                 "quality_tier": "draft", "pretrained_loras": {"A": "loras/x/A.safetensors"}},
+                pipeline=pipe, store=MissingLoraStore(tmp_path / "b.tar.gz"),
+                workdir=tmp_path / "work", job_id="j")
+    assert pipe.trained == []                                 # failed before training anything

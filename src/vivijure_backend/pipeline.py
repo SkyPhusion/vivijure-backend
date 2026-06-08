@@ -105,6 +105,12 @@ class GpuPipeline:
     def progress(self):
         return getattr(self, "_progress", None) or _NULL_PROGRESS
 
+    def set_pretrained_loras(self, mapping: dict[str, str]) -> None:
+        """Replace the reused-LoRA refs with the harness's local-path map (it stages them from R2
+        before execute). The pipeline never touches R2 itself; it just loads the local files the
+        `if p.is_file()` check in `execute` already understands."""
+        self.pretrained_loras = dict(mapping)
+
     # --- GPU stages, behind overridable methods (stubbed in CPU tests) ---
 
     def _train_slot(self, char, out_dir: Path) -> Path:
