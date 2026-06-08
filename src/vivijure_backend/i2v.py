@@ -176,42 +176,67 @@ _FBCACHE_THRESHOLD = {
 }
 
 
+def _feature_cache_targets(pipe):
+    """The DiT(s) to cache. Wan 2.2 A14B is a Mixture-of-Experts: a high-noise expert
+    (`transformer`) runs the early denoise steps and a low-noise expert (`transformer_2`) the rest,
+    swapping at the boundary ratio mid-denoise. Caching only `transformer` leaves the back ~70% of
+    steps (the low-noise expert) uncached -- the step-~12 hit-cliff we measured (only ~1.2x instead
+    of ~1.8x). So return every expert the pipe exposes. getattr-safe: a single-DiT pipe (or a future
+    attribute rename) just yields whatever is present, never crashes."""
+    targets = []
+    for attr in ("transformer", "transformer_2"):
+        t = getattr(pipe, attr, None)
+        if t is not None:
+            targets.append(t)
+    return targets
+
+
 def _set_feature_cache(pipe, feature_cache) -> None:
-    """Install (or clear) the denoise feature cache on the Wan DiT for this shot.
+    """Install (or clear) the denoise feature cache on the Wan DiT(s) for this shot.
 
-    The i2v pipe is a process-global reused across every shot (like the keyframe pipe), and the
-    cache accumulates per-timestep state within ONE shot, so it MUST reset each call or it leaks
-    across shots -- the per-scene-state bug class that bit keyframes in v0.1.4/v0.1.5. So always
-    clear any prior cache first, then (re)install a fresh one for the requested mode.
+    Wan 2.2 A14B is a two-expert MoE, so the cache is installed on BOTH experts (`transformer`
+    high-noise + `transformer_2` low-noise); caching only the first leaves the later steps -- the
+    bulk of the denoise -- uncached (see `_feature_cache_targets`).
 
-    Mechanism: diffusers FirstBlockCache (the generic TeaCache successor) via the MATCHED
-    `CacheMixin.enable_cache(FirstBlockCacheConfig)` / `disable_cache()` pair. (NOT the standalone
-    `apply_first_block_cache` -- it installs the hooks but does not set the `is_cache_enabled` flag
-    `disable_cache()` checks, so the per-shot reset would silently no-op and rely on re-apply
-    replacing the hooks; the matched pair makes the reset real, which is the per-scene-state bug
-    class that bit keyframes in v0.1.4/v0.1.5.) FasterCache / PyramidAttentionBroadcast are NOT
-    wired for WanTransformer3DModel (diffusers #11134), so FBCache is the supported path. NONE
-    bypasses. Best-effort like `_set_distill`: a cache that cannot attach runs full uncached rather
-    than failing the render. Verified on an H200 (:0.1.9): ~1.8-2x on the full-step Wan i2v."""
-    transformer = getattr(pipe, "transformer", None)
-    if transformer is None:
+    The i2v pipe is process-global and reused across every shot, and each expert's cache holds
+    per-timestep state, so it MUST reset each call or it leaks across shots -- the per-scene-state
+    bug class that bit keyframes in v0.1.4/v0.1.5. Via the MATCHED
+    `CacheMixin.enable_cache(FirstBlockCacheConfig)` / `disable_cache()` pair (guarded by
+    `is_cache_enabled`), so the reset is real and silent. (NOT the standalone
+    `apply_first_block_cache`, whose hooks `disable_cache()` does not clear -> re-apply raises
+    "hook already exists" and the shot runs uncached.) FasterCache / PyramidAttentionBroadcast are
+    NOT wired for WanTransformer3DModel (diffusers #11134), so FBCache is the path. NONE bypasses.
+    Best-effort PER EXPERT like `_set_distill`: an expert that cannot cache runs full rather than
+    failing the render."""
+    targets = _feature_cache_targets(pipe)
+    if not targets:
         return
-    # Reset: clear the previous shot's cache (matched pair), guarded so it is silent when none is on.
-    try:
-        if getattr(transformer, "is_cache_enabled", False):
-            transformer.disable_cache()
-    except Exception:
-        pass
+
+    # Reset: clear every expert's prior-shot cache (matched pair), silent when none is on.
+    for t in targets:
+        try:
+            if getattr(t, "is_cache_enabled", False):
+                t.disable_cache()
+        except Exception:
+            pass
+
     if feature_cache is FeatureCache.NONE:
         return
+
     try:
         from diffusers.hooks import FirstBlockCacheConfig
-
-        threshold = _FBCACHE_THRESHOLD.get(feature_cache, 0.20)
-        transformer.enable_cache(FirstBlockCacheConfig(threshold=threshold))
     except Exception as e:  # noqa: BLE001
-        print(f"i2v feature cache {getattr(feature_cache, 'value', feature_cache)} not applied "
+        print(f"i2v feature cache {getattr(feature_cache, 'value', feature_cache)} unavailable "
               f"({e}); running full uncached.", flush=True)
+        return
+
+    threshold = _FBCACHE_THRESHOLD.get(feature_cache, 0.20)
+    for t in targets:
+        try:
+            t.enable_cache(FirstBlockCacheConfig(threshold=threshold))
+        except Exception as e:  # noqa: BLE001
+            print(f"i2v feature cache {getattr(feature_cache, 'value', feature_cache)} not applied "
+                  f"to {type(t).__name__} ({e}); that expert runs uncached.", flush=True)
 
 
 def _set_distill(pipe, distill: bool) -> None:

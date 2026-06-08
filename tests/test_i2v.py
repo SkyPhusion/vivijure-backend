@@ -34,8 +34,10 @@ class _FakeTransformer:
 
 
 class _FakePipe:
-    def __init__(self):
+    def __init__(self, dual=True):
         self.transformer = _FakeTransformer()
+        if dual:
+            self.transformer_2 = _FakeTransformer()   # Wan 2.2 low-noise MoE expert
 
 
 def _fake_diffusers_hooks(monkeypatch):
@@ -106,6 +108,35 @@ def test_feature_cache_is_best_effort_when_the_cache_cannot_attach():
 def test_feature_cache_tolerates_a_pipe_without_a_transformer():
     class Bare: pass
     _set_feature_cache(Bare(), FeatureCache.MIXCACHE)  # no transformer -> no-op, no raise
+
+
+def test_feature_cache_enables_both_moe_experts(monkeypatch):
+    # The bug: Wan 2.2 has two DiTs (transformer high-noise + transformer_2 low-noise); caching
+    # only the first left the back ~70% of steps uncached. Both experts must get the cache.
+    _fake_diffusers_hooks(monkeypatch)
+    pipe = _FakePipe(dual=True)
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)
+    assert pipe.transformer.enabled == [0.20]
+    assert pipe.transformer_2.enabled == [0.20]        # previously skipped -> the step-12 cliff
+
+
+def test_feature_cache_per_shot_reset_clears_both_experts(monkeypatch):
+    _fake_diffusers_hooks(monkeypatch)
+    pipe = _FakePipe(dual=True)
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)     # shot 1
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)     # shot 2
+    assert pipe.transformer.disabled == 1 and pipe.transformer_2.disabled == 1
+    assert pipe.transformer.enabled == [0.20, 0.20]
+    assert pipe.transformer_2.enabled == [0.20, 0.20]
+
+
+def test_feature_cache_single_dit_pipe_still_works(monkeypatch):
+    # A pipe with no transformer_2 (draft / non-MoE / future) just caches the one it has.
+    _fake_diffusers_hooks(monkeypatch)
+    pipe = _FakePipe(dual=False)
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)
+    assert pipe.transformer.enabled == [0.20]
+    assert not hasattr(pipe, "transformer_2")
 
 
 # ----------------------------------------------------- per-step progress callback (item M)
