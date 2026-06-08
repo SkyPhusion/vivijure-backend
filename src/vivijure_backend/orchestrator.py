@@ -163,8 +163,11 @@ def plan(
     # --- per-scene keyframe + i2v plan ---
     want_i2v = action in (Action.RENDER, Action.FINALIZE)
     want_keyframe = action in (Action.RENDER, Action.REGEN_SHOT)
+    # A train-only job (neither keyframe nor i2v) has no per-scene render: building scene
+    # plans would estimate keyframe GPU-seconds for work that never fires, which is exactly
+    # the wasteful over-estimate this planner exists to prevent.
     scene_plans: list[ScenePlan] = []
-    for sc in scenes:
+    for sc in (scenes if (want_keyframe or want_i2v) else []):
         mode = _keyframe_mode(sc, action, existing_keyframes, want_keyframe)
         if mode is not KeyframeMode.GENERATE and want_keyframe:
             skips.append(f"{sc.id} keyframe: {mode.value} (no SDXL pass)")

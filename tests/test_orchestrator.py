@@ -1,0 +1,154 @@
+"""The planner's whole job is to decide the render on the CPU and eliminate GPU work before
+it fires. These tests pin every elimination path and the cost arithmetic."""
+from vivijure_backend.contract import RenderRequest, Storyboard
+from vivijure_backend.device import Tier
+from vivijure_backend.orchestrator import (
+    MULTI_CHAR_DEFAULTS,
+    Action,
+    KeyframeMode,
+    plan,
+    validate,
+)
+
+
+def _sb(scenes, use_characters=("A", "B"), **extra):
+    return Storyboard.from_dict({"use_characters": list(use_characters), "scenes": scenes, **extra})
+
+
+def _req(action="render", quality="final", **extra):
+    return RenderRequest.from_dict({"action": action, "project": "p", "bundle_key": "b",
+                                    "quality_tier": quality, **extra})
+
+
+TWO_SCENES = [
+    {"id": "shot_01", "prompt": "A alone", "character_slots": ["A"], "target_seconds": 5},
+    {"id": "shot_02", "prompt": "A and B", "character_slots": ["A", "B"], "target_seconds": 4},
+]
+
+
+# ------------------------------------------------------------------------- full render
+
+def test_render_trains_all_and_generates_all():
+    p = plan(_req(), _sb(TWO_SCENES))
+    assert sorted(p.lora.train) == ["A", "B"]
+    assert p.lora.reuse == []
+    assert p.keyframes_to_generate == 2
+    assert p.shots_to_animate == 2
+    assert p.assemble_off_gpu is True
+    assert all(s.keyframe_mode is KeyframeMode.GENERATE for s in p.scenes)
+
+
+def test_multi_char_scene_gets_anti_bleed_defaults():
+    p = plan(_req(), _sb(TWO_SCENES))
+    single, multi = p.scenes
+    assert single.multi_char == {}
+    assert multi.is_multi_character
+    assert multi.multi_char == MULTI_CHAR_DEFAULTS
+    assert multi.multi_char["pose_conditioning"] is True
+
+
+def test_i2v_tier_follows_quality():
+    assert plan(_req(quality="draft"), _sb(TWO_SCENES)).scenes[0].i2v_tier is Tier.RTX_PRO_6000
+    assert plan(_req(quality="standard"), _sb(TWO_SCENES)).scenes[0].i2v_tier is Tier.H200
+    assert plan(_req(quality="final"), _sb(TWO_SCENES)).scenes[0].i2v_tier is Tier.B200
+
+
+# ----------------------------------------------------------------------- eliminations
+
+def test_already_trained_lora_is_reused_not_retrained():
+    p = plan(_req(), _sb(TWO_SCENES), trained_slots={"A"})
+    assert p.lora.train == ["B"]
+    assert p.lora.reuse == ["A"]
+    assert any("already trained" in s for s in p.skips)
+
+
+def test_pretrained_lora_passthrough():
+    p = plan(_req(pretrained_loras={"A": "loras/A.safetensors"}), _sb(TWO_SCENES))
+    assert p.lora.train == ["B"]
+    assert "A" in p.lora.reuse
+    assert any("pretrained" in s for s in p.skips)
+
+
+def test_injected_start_image_skips_keyframe_gen():
+    scenes = [dict(TWO_SCENES[0]), {**TWO_SCENES[1], "start_image": "clips/shot_02_keyframe.png"}]
+    p = plan(_req(), _sb(scenes))
+    modes = {s.shot_id: s.keyframe_mode for s in p.scenes}
+    assert modes["shot_01"] is KeyframeMode.GENERATE
+    assert modes["shot_02"] is KeyframeMode.INJECT
+    assert p.keyframes_to_generate == 1
+    assert any("inject" in s for s in p.skips)
+
+
+def test_existing_keyframe_is_reused():
+    p = plan(_req(), _sb(TWO_SCENES), existing_keyframes={"shot_01"})
+    modes = {s.shot_id: s.keyframe_mode for s in p.scenes}
+    assert modes["shot_01"] is KeyframeMode.REUSE
+    assert modes["shot_02"] is KeyframeMode.GENERATE
+    assert p.keyframes_to_generate == 1
+
+
+# --------------------------------------------------------------------------- actions
+
+def test_finalize_is_i2v_only_over_reused_keyframes():
+    # finalize must never train or generate keyframes, even with nothing trained yet.
+    p = plan(_req(action="finalize"), _sb(TWO_SCENES))
+    assert p.action is Action.FINALIZE
+    assert p.lora.train == []
+    assert p.keyframes_to_generate == 0
+    assert all(s.keyframe_mode is KeyframeMode.REUSE for s in p.scenes)
+    assert p.shots_to_animate == 2
+
+
+def test_regen_shot_is_keyframe_only_no_i2v():
+    p = plan(_req(action="regen_shot"), _sb(TWO_SCENES))
+    assert p.shots_to_animate == 0
+    assert p.keyframes_to_generate == 2
+
+
+def test_train_lora_costs_only_training_no_per_scene_work():
+    # A LoRA-only job has no per-scene render; it must not estimate keyframe or i2v GPU time.
+    p = plan(_req(action="train_lora"), _sb(TWO_SCENES))
+    assert p.action is Action.TRAIN_LORA
+    assert sorted(p.lora.train) == ["A", "B"]
+    assert p.keyframes_to_generate == 0
+    assert p.shots_to_animate == 0
+    assert p.estimated_gpu_seconds == 2 * 180.0  # two LoRAs, nothing else
+
+
+def test_process_shot_ids_scopes_the_render():
+    p = plan(_req(action="finalize", process_shot_ids=["shot_02"]), _sb(TWO_SCENES))
+    assert [s.shot_id for s in p.scenes] == ["shot_02"]
+    assert any("out of process_shot_ids scope" in s for s in p.skips)
+
+
+def test_unknown_action_falls_back_to_render():
+    assert plan(_req(action="banana"), _sb(TWO_SCENES)).action is Action.RENDER
+
+
+# -------------------------------------------------------------------------- validate
+
+def test_validate_flags_slots_not_in_cast():
+    sb = _sb([{"id": "s1", "prompt": "x", "character_slots": ["A", "B"]}], use_characters=["A"])
+    errs = validate(_req(), sb)
+    assert any("not in use_characters" in e for e in errs)
+
+
+def test_validate_flags_unknown_process_shot_ids():
+    errs = validate(_req(process_shot_ids=["shot_99"]), _sb(TWO_SCENES))
+    assert any("process_shot_ids not in storyboard" in e for e in errs)
+
+
+def test_validate_clean_storyboard_has_no_errors():
+    assert validate(_req(), _sb(TWO_SCENES)) == []
+
+
+# ------------------------------------------------------------------------------ cost
+
+def test_cost_grows_with_quality_and_is_enumerated():
+    draft = plan(_req(quality="draft"), _sb(TWO_SCENES))
+    final = plan(_req(quality="final"), _sb(TWO_SCENES))
+    assert final.estimated_gpu_seconds > draft.estimated_gpu_seconds
+    # every reuse/skip is spelled out for the operator
+    p = plan(_req(), _sb(TWO_SCENES), trained_slots={"A"}, existing_keyframes={"shot_01"})
+    assert p.skips  # non-empty: at least the reused LoRA and reused keyframe
+    assert "saved:" in p.summary()
