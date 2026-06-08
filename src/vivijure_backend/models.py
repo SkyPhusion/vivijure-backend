@@ -116,9 +116,15 @@ class ModelServer:
     # ---- loaders (deferred heavy imports; bodies need a GPU, verified on the pod) ----
 
     def keyframe_pipeline(self):
-        """SDXL pipeline for keyframes: load at bf16, quantize the UNet to fp8 with torchao,
-        set the attention backend, then attach the few-step distill LoRA. Adapters (InstantID
-        / IP-Adapter / ControlNet) are attached by keyframe.py per scene, not here."""
+        """SDXL pipeline for keyframes: load at bf16, set the attention backend. Adapters and the
+        per-scene character LoRAs (plus InstantID / IP-Adapter / ControlNet) are attached by
+        keyframe.py per scene.
+
+        NOT fp8-quantized: keyframe.py loads DYNAMIC per-scene character LoRAs onto the UNet, and
+        peft cannot attach a LoRA to a torchao-quantized linear (TorchaoLoraLinear init mismatch,
+        the #12535 family). SDXL is small (~6.5GB UNet), so bf16 is essentially free and keeps LoRA
+        loading working on every card. (i2v CAN use fp8 because it FUSES its single distill LoRA
+        before quantizing -- see i2v_pipeline.)"""
         if "keyframe" in self._cache:
             return self._cache["keyframe"]
         import torch
@@ -127,8 +133,6 @@ class ModelServer:
         spec = self.specs[ModelRole.KEYFRAME_BASE]
         pipe = StableDiffusionXLPipeline.from_pretrained(spec.repo_id, torch_dtype=torch.bfloat16)
         pipe.to("cuda")
-        if self.device.supports_fp8:
-            _quantize_fp8(pipe.unet)  # torchao MXFP8 (Blackwell) / fp8 (Hopper)
         _set_attention(pipe, self.device)
         self._cache["keyframe"] = pipe
         return pipe
