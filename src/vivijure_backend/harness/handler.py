@@ -21,6 +21,7 @@ from ..assemble import ClipInput, assemble, build_manifest, order_for_storyboard
 from ..contract import Bundle, RenderRequest, RenderResult, Keyframe, Clip
 from ..orchestrator import RenderPlan, plan as make_plan, validate
 from . import keys
+from .progress import NullEmitter, ProgressEmitter
 
 
 class HarnessError(RuntimeError):
@@ -56,6 +57,9 @@ def run_job(
     pipeline: Pipeline,
     store,
     workdir: Path,
+    job_id: str = "local",
+    mirrored: bool = False,
+    on_progress=None,
     trained_slots: set[str] = frozenset(),
     existing_keyframes: set[str] = frozenset(),
 ) -> dict:
@@ -63,34 +67,62 @@ def run_job(
 
     `store` is an R2-like object with `get_file`, `put_file`, `put_dir_as_tar` (the real `R2`,
     or a fake in tests). Nothing here touches a GPU; the GPU work is `pipeline.execute`.
+
+    Progress is emitted to the structured channel keyed by `(project, job_id)`: `mirrored` records
+    whether the cold-start model mirror ran, `on_progress` is the optional RunPod hook. The whole
+    channel is best-effort and never fails the render; a real render failure still propagates (an
+    `error` event is recorded first).
     """
     req = RenderRequest.from_dict(job)
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    # --- bundle in ---
-    tar = store.get_file(req.bundle_key, workdir / "bundle.tar.gz")
-    bundle = Bundle.extract(Path(tar), workdir / "project")
+    progress = ProgressEmitter(store, req.project, job_id, on_progress=on_progress)
+    progress.emit("started", action=req.action, quality=req.quality_tier, project=req.project)
+    progress.emit("mirror_done", pulled=bool(mirrored))
+    try:
+        # --- bundle in ---
+        tar = store.get_file(req.bundle_key, workdir / "bundle.tar.gz")
+        bundle = Bundle.extract(Path(tar), workdir / "project")
 
-    # --- validate + plan (CPU) ---
-    errs = validate(req, bundle.storyboard)
-    if errs:
-        raise HarnessError("invalid render job: " + "; ".join(errs))
-    plan = make_plan(
-        req, bundle.storyboard,
-        trained_slots=set(trained_slots) | set(req.pretrained_loras),
-        existing_keyframes=set(existing_keyframes),
-    )
+        # --- validate + plan (CPU) ---
+        errs = validate(req, bundle.storyboard)
+        if errs:
+            raise HarnessError("invalid render job: " + "; ".join(errs))
+        plan = make_plan(
+            req, bundle.storyboard,
+            trained_slots=set(trained_slots) | set(req.pretrained_loras),
+            existing_keyframes=set(existing_keyframes),
+        )
 
-    # --- GPU stages (only what the plan kept) ---
-    outputs = pipeline.execute(plan, bundle, workdir)
+        # --- GPU stages (only what the plan kept) ---
+        _inject_progress(pipeline, progress)
+        outputs = pipeline.execute(plan, bundle, workdir)
 
-    # --- finish + results out ---
-    return _finish(req, plan, bundle, outputs, store, workdir).to_dict()
+        # --- finish + results out ---
+        result = _finish(req, plan, bundle, outputs, store, workdir, progress)
+        progress.complete(output_key=result.output_key, seconds=result.seconds,
+                          clips=len(result.clips), keyframes=len(result.keyframes))
+        return result.to_dict()
+    except Exception as e:
+        progress.error("render", e)  # best-effort failure marker, then let the render fail
+        raise
+
+
+def _inject_progress(pipeline, progress) -> None:
+    """Hand the emitter to a pipeline that wants per-stage progress (GpuPipeline), duck-typed so
+    the `Pipeline` protocol and the test fakes stay unchanged. Best-effort."""
+    setter = getattr(pipeline, "set_progress", None)
+    if callable(setter):
+        try:
+            setter(progress)
+        except Exception:
+            pass
 
 
 def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outputs,
-            store, workdir: Path) -> RenderResult:
+            store, workdir: Path, progress=None) -> RenderResult:
+    progress = progress or NullEmitter()
     project = req.project
     result = RenderResult(project=project)
 
@@ -119,8 +151,10 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
         manifest = build_manifest(ordered, output_name="full.mp4",
                                   audio=str(outputs.audio) if outputs.audio else None)
         man_path = write_manifest(manifest, workdir / "manifest.json")
-        store.put_file(man_path, keys.join("renders", project, "manifest.json"),
-                       content_type="application/json")
+        man_key = keys.join("renders", project, "manifest.json")
+        store.put_file(man_path, man_key, content_type="application/json")
+        progress.emit("assemble_done", offloaded=True, clips=len(ordered))
+        progress.emit("upload_done", key=man_key)
     elif ordered or outputs.final_video:
         # Normal finish: merge here (off-GPU) unless the pipeline already produced the film.
         final = Path(outputs.final_video) if outputs.final_video else \
@@ -129,9 +163,12 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
         result.output_key = store.put_file(final, keys.output_key(project), content_type="video/mp4")
         result.seconds = probe_duration(final)
         result.has_audio = probe_has_audio(final)
+        progress.emit("assemble_done", offloaded=False, seconds=result.seconds)
+        progress.emit("upload_done", key=result.output_key)
 
     # Project state for the next incremental render.
     result.state_key = store.put_dir_as_tar(bundle.root, keys.state_key(project))
+    progress.emit("upload_done", key=result.state_key)
     return result
 
 
@@ -145,8 +182,23 @@ def handler(job: dict) -> dict:
     from .r2 import R2, R2Config
     from .pipeline_registry import get_pipeline  # the deploy registers its GPU pipeline here
 
-    ensure_models()
+    mirrored = ensure_models()
     store = R2(R2Config.from_env())
     payload = job.get("input", job)
     workdir = Path(tempfile.mkdtemp(prefix="vj-job-"))
-    return run_job(payload, pipeline=get_pipeline(), store=store, workdir=workdir)
+    return run_job(payload, pipeline=get_pipeline(), store=store, workdir=workdir,
+                   job_id=str(job.get("id") or "unknown"), mirrored=bool(mirrored),
+                   on_progress=_runpod_progress_hook(job))
+
+
+def _runpod_progress_hook(job: dict):
+    """Option A: mirror each snapshot into RunPod's status `progress` field, best-effort. The
+    `runpod` import is deferred so the harness stays CPU-importable; a missing SDK or a failed
+    update is swallowed (the R2 channel is the source of truth)."""
+    def hook(snapshot: dict) -> None:
+        try:
+            import runpod
+            runpod.serverless.progress_update(job, snapshot)
+        except Exception:
+            pass
+    return hook

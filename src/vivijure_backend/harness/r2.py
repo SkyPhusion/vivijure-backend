@@ -77,6 +77,22 @@ class R2:
         self._client().upload_file(str(path), self.config.bucket, key, ExtraArgs=extra or None)
         return key
 
+    def put_bytes(self, data: bytes, key: str, *, content_type: str | None = None,
+                  metadata: dict[str, str] | None = None) -> str:
+        """Upload in-memory bytes with no temp file (for the small JSON / NDJSON the progress
+        channel writes). put_object, not upload_file, since there is nothing on disk."""
+        kwargs: dict[str, object] = {"Bucket": self.config.bucket, "Key": key, "Body": data}
+        if content_type:
+            kwargs["ContentType"] = content_type
+        if metadata:
+            kwargs["Metadata"] = metadata
+        self._client().put_object(**kwargs)
+        return key
+
+    def get_bytes(self, key: str) -> bytes:
+        """Read one object into memory (for reading a progress snapshot back)."""
+        return self._client().get_object(Bucket=self.config.bucket, Key=key)["Body"].read()
+
     def put_dir_as_tar(self, src_dir: Path, key: str, *, metadata: dict[str, str] | None = None) -> str:
         """Tar a directory contents-at-root (`arcname="."`) and upload it. Contents-at-root,
         not `<name>/`-rooted: the inbound bundle extracts INTO the project dir, so a name-rooted

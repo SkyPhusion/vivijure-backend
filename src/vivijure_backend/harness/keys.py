@@ -44,6 +44,18 @@ def clip_key(project: str, shot_id: str) -> str:
     return f"renders/{_slug(project)}/clips/{shot_id}.mp4"
 
 
+def progress_log_key(project: str, job_id: str) -> str:
+    """The append-only NDJSON event stream for one render, keyed by project AND job id so
+    concurrent or cancelled runs of the same project never clobber each other."""
+    return f"renders/{_slug(project)}/progress/{_slug(job_id)}.ndjson"
+
+
+def progress_snapshot_key(project: str, job_id: str) -> str:
+    """The latest-state JSON snapshot for one render (the cheap thing a /status route or Uptime
+    Kuma polls), keyed the same way."""
+    return f"renders/{_slug(project)}/progress/{_slug(job_id)}.json"
+
+
 def join(*parts: str) -> str:
     """POSIX-join key parts (R2 keys are always forward-slash, regardless of worker OS)."""
     return posixpath.join(*parts)

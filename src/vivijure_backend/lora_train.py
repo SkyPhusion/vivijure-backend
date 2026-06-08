@@ -87,6 +87,7 @@ def train_slot(
     *,
     config: LoraTrainConfig | None = None,
     base_repo: str | None = None,
+    progress_cb=None,
 ) -> TrainedLora:
     """Train one character's SDXL LoRA from its reference images and save the adapter.
 
@@ -210,6 +211,11 @@ def train_slot(
                           StableDiffusionXLPipeline, get_peft_model_state_dict, convert_state_dict_to_diffusers)
         if (step + 1) % 50 == 0 or step == 0:
             print(f"[lora {char.slot}] step {step + 1}/{cfg.max_steps} loss={last_loss:.4f}", flush=True)
+            if progress_cb is not None:
+                try:
+                    progress_cb(step + 1, cfg.max_steps, last_loss)  # throttled: only at the log cadence
+                except Exception:
+                    pass  # best-effort: a progress callback must never break training
 
     # --- save the final adapter in diffusers' SDXL LoRA format ---
     _save_adapter(unet, out_dir, StableDiffusionXLPipeline,

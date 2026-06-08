@@ -27,10 +27,14 @@ from . import keyframe as _keyframe
 from . import lora_train as _lora_train
 from .config import RenderConfig
 from .harness.handler import Outputs
+from .harness.progress import NullEmitter
 from .keyframe import KeyframeParams, build_prompt
 from .i2v import I2VParams, frames_for
 from .orchestrator import KeyframeMode, RenderPlan
 from .contract import Bundle
+
+# Shared no-op emitter for a pipeline run with no progress channel wired (the test default).
+_NULL_PROGRESS = NullEmitter()
 
 
 # --------------------------------------------------------------- config -> engine params
@@ -92,10 +96,21 @@ class GpuPipeline:
             self.server = ModelServer()
         return self.server
 
+    def set_progress(self, emitter) -> None:
+        """Wire a progress emitter (the harness calls this per job). Default is a no-op emitter, so
+        the pipeline runs unchanged without one."""
+        self._progress = emitter
+
+    @property
+    def progress(self):
+        return getattr(self, "_progress", None) or _NULL_PROGRESS
+
     # --- GPU stages, behind overridable methods (stubbed in CPU tests) ---
 
     def _train_slot(self, char, out_dir: Path) -> Path:
-        return _lora_train.train_slot(char, out_dir, config=self.config.lora).path
+        # Throttled per-step training progress (the long pole); lora_train calls the cb every N steps.
+        cb = self.progress.train_step_cb(char.slot)
+        return _lora_train.train_slot(char, out_dir, config=self.config.lora, progress_cb=cb).path
 
     def _render_keyframe(self, scene, cast, storyboard, out_path: Path, lora_paths: dict[str, Path]) -> Path:
         return _keyframe.render_keyframe(
@@ -126,6 +141,7 @@ class GpuPipeline:
             path = self._train_slot(char, workdir / "loras" / slot)
             out.loras[slot] = path
             lora_paths[slot] = path
+            self.progress.emit("train_done", slot=slot, path=str(path))
         # Reused / pretrained adapters feed keyframing too, when staged on disk locally (the
         # adapter is portable .safetensors; an R2-key reference that is not a local file is left
         # to the deploy to stage, and the shot falls back to IP-Adapter identity if absent).
@@ -143,6 +159,7 @@ class GpuPipeline:
                 kf_path = self._render_keyframe(
                     scene, cast, storyboard, workdir / "keyframes" / f"{sp.shot_id}.png", lora_paths)
                 out.keyframes[sp.shot_id] = kf_path
+                self.progress.emit("keyframe_done", shot=sp.shot_id)
             else:
                 kf_path = self._resolve_keyframe(sp, scene, bundle, workdir)
             if sp.needs_i2v and kf_path is not None:
@@ -150,6 +167,7 @@ class GpuPipeline:
                     scene, kf_path, build_prompt(scene, cast, storyboard),
                     workdir / "clips" / f"{sp.shot_id}.mp4")
                 out.clips.append((sp.shot_id, clip))
+                self.progress.emit("i2v_done", shot=sp.shot_id)
         return out
 
     def _resolve_keyframe(self, sp, scene, bundle: Bundle, workdir: Path) -> Path | None:
