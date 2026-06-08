@@ -251,3 +251,25 @@ def test_run_job_fails_fast_when_a_reused_lora_cannot_be_staged(tmp_path):
                 pipeline=pipe, store=MissingLoraStore(tmp_path / "b.tar.gz"),
                 workdir=tmp_path / "work", job_id="j")
     assert pipe.trained == []                                 # failed before training anything
+
+
+def test_run_job_refuses_to_drop_staged_loras_a_pipeline_cannot_receive(tmp_path):
+    # End-to-end guarantee: if staging succeeds but the pipeline has no way to receive the map,
+    # raise rather than silently render the character without its LoRA (the asymmetry the review
+    # flagged). A job with no reused LoRAs would be fine on such a pipeline; this one is not.
+    import pytest
+    from vivijure_backend.harness.handler import HarnessError
+
+    _extract_bundle(tmp_path)
+
+    class NoSetterPipeline:
+        """A pipeline that forgot set_pretrained_loras."""
+        def execute(self, plan, bundle, workdir):
+            return Outputs()
+
+    with pytest.raises(HarnessError, match="cannot receive staged reused LoRAs"):
+        run_job({"action": "render", "project": "neon", "bundle_key": "bundles/neon.tar.gz",
+                 "quality_tier": "draft", "pretrained_loras": {"A": "loras/neon/A/x.safetensors"},
+                 "render_overrides": {"finish_offloaded": True}},
+                pipeline=NoSetterPipeline(), store=StagingStore(tmp_path / "b.tar.gz"),
+                workdir=tmp_path / "work", job_id="j")

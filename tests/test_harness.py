@@ -108,6 +108,9 @@ class FakeStore:
 
 class FakePipeline:
     """Produces empty artifact files for exactly the work the plan kept; no GPU."""
+    def set_pretrained_loras(self, mapping):
+        self.pretrained_loras = mapping   # a fake still accepts the staged map (it ignores it)
+
     def execute(self, plan, bundle, workdir):
         out = Outputs()
         for slot in plan.lora.train:

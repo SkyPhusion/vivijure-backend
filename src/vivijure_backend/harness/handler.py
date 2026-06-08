@@ -154,15 +154,22 @@ def _stage_pretrained_loras(req: RenderRequest, store, workdir: Path, progress) 
 
 
 def _inject_pretrained_loras(pipeline, staged: dict[str, str]) -> None:
-    """Hand the local-path adapter map to a pipeline that stages reused LoRAs (GpuPipeline),
-    duck-typed like `_inject_progress` so the protocol and the test fakes stay unchanged. The
-    pipeline's own `if path.is_file()` check then picks them up (they are now local). Best-effort."""
+    """Hand the local-path adapter map to the pipeline so it loads the reused LoRAs.
+
+    Unlike `_inject_progress`, this is NOT best-effort, and the asymmetry is deliberate: progress
+    is optional (a dropped event does not change the render), but a dropped LoRA map silently
+    renders the character without its identity, which is the exact outcome `_stage_pretrained_loras`
+    fails fast to prevent. So when there is something to deliver, a pipeline that cannot receive it
+    (no `set_pretrained_loras`, or a setter that throws) is a hard error, not a swallow. A job with
+    no reused LoRAs injects nothing, so a pipeline without the setter is fine."""
+    if not staged:
+        return
     setter = getattr(pipeline, "set_pretrained_loras", None)
-    if callable(setter):
-        try:
-            setter(staged)
-        except Exception:
-            pass
+    if not callable(setter):
+        raise HarnessError(
+            f"pipeline cannot receive staged reused LoRAs {sorted(staged)} "
+            "(no set_pretrained_loras); refusing to render them without their identity adapters")
+    setter(staged)  # a setter failure propagates: dropping staged LoRAs is silent-wrong-identity
 
 
 def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outputs,
