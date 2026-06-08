@@ -164,11 +164,7 @@ def _render_single(pipe, prompt, scene, cast, cfg, loras, generator):
     """One character (or none): the slot's LoRA bound, identity from a single IP-Adapter image.
     The plain SDXL identity path."""
     slot = scene.character_slots[0] if scene.character_slots else None
-    adapters, weights = ["distill"], [1.0]
-    if slot and slot in loras:
-        pipe.load_lora_weights(str(loras[slot]), adapter_name=slot)
-        adapters.append(slot); weights.append(cfg.lora_scale)
-    _set_adapters(pipe, adapters, weights)
+    _bind_loras(pipe, {slot: loras[slot]} if (slot and slot in loras) else {}, cfg.lora_scale)
 
     ip_images = _ref_images(cast, slot, count=1) if slot else None
     if ip_images:
@@ -192,12 +188,7 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
     res = cfg.resolution
     boxes = region_boxes(res, res, len(slots), orientation="vertical")
 
-    adapters, weights = ["distill"], [1.0]
-    for s in slots:
-        if s in loras:
-            pipe.load_lora_weights(str(loras[s]), adapter_name=s)
-            adapters.append(s); weights.append(cfg.lora_scale)
-    _set_adapters(pipe, adapters, weights)
+    _bind_loras(pipe, {s: loras[s] for s in slots if s in loras}, cfg.lora_scale)
 
     # One IP-Adapter image per slot (its refs), each confined to its region's mask.
     _ensure_ip_adapter(pipe, n=len(slots))
@@ -221,12 +212,36 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
 
 # --------------------------------------------------------------------------- internals (GPU)
 
-def _set_adapters(pipe, names, weights):
-    """Activate the named LoRA adapters at the given weights (distill + per-slot character)."""
+def _bind_loras(pipe, slot_paths: dict, scale: float) -> list[str]:
+    """Load each slot's character LoRA and activate it alongside whatever base adapter is already
+    on the pipe (a few-step distill LoRA, if the ModelServer loaded one). Character LoRAs go on at
+    the moderate per-slot `scale` (the anti-bleed weight); any pre-existing base adapter stays at
+    1.0. Discovering the base adapter instead of hardcoding a name means this is correct whether or
+    not a distill LoRA is present, and a missing one never silently drops the character identity."""
+    base = _adapter_names(pipe)  # adapters already on the pipe before we add characters
+    loaded = []
+    for slot, path in slot_paths.items():
+        pipe.load_lora_weights(str(path), adapter_name=slot)
+        loaded.append(slot)
+    if loaded:
+        names = base + loaded
+        pipe.set_adapters(names, adapter_weights=[1.0] * len(base) + [scale] * len(loaded))
+    return loaded
+
+
+def _adapter_names(pipe) -> list[str]:
+    """Names of the LoRA adapters currently loaded on the pipeline, de-duplicated across its
+    components. Empty when none are loaded."""
     try:
-        pipe.set_adapters(names, adapter_weights=weights)
+        listed = pipe.get_list_adapters()  # {component: [adapter_name, ...]}
     except Exception:
-        pass  # a pipeline with only the base distill LoRA has nothing to combine; fine
+        return []
+    seen: list[str] = []
+    for names in listed.values():
+        for n in names:
+            if n not in seen:
+                seen.append(n)
+    return seen
 
 
 def _ensure_ip_adapter(pipe, n: int = 1):
