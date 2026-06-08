@@ -1,31 +1,40 @@
 # Vivijure backend worker runtime stack.
 #
-# PROVISIONAL PINS. The exact version set (diffusers / transformers / torchao / imageio-ffmpeg +
-# the Wan / fp8 specifics) is being nailed down on the H100 i2v validation; the PM hands over the
-# validated list, which REPLACES the floors below. Keep this file the single source of the
-# version set so the image's dep layer stays reproducible. torch/torchvision/torchaudio are NOT
-# here: they install from the cu128 index in the Dockerfile (the Blackwell-safe CUDA line).
+# VALIDATED PINS (2026-06-08). The render-engine set below is the exact version set that
+# pod-validated the full pipeline on a RunPod H200 (fp8 resident + fused 4-step distill, sharp
+# 720p i2v) and H100 (bf16 + CPU-offload), plus the SDXL keyframe single + regional no-bleed
+# paths on an A6000. Keep this file the single source of the version set so the image's dep
+# layer stays reproducible. torch/torchvision/torchaudio are NOT here: they install from the
+# cu128 index in the Dockerfile (the Blackwell-safe CUDA line) -- the validated render ran on
+# torch 2.7.1+cu128.
 
-# --- render engines (SDXL keyframe + Wan 2.2 i2v) ---
-diffusers>=0.35
-transformers>=4.46
-accelerate>=1.1
-peft>=0.13
-safetensors>=0.4
-torchao>=0.7              # fp8 (MXFP8 on Blackwell / fp8 on Hopper) for the keyframe + i2v paths
-imageio-ffmpeg>=0.5       # Wan frame export (diffusers.utils.export_to_video)
+# --- render engines (SDXL keyframe + Wan 2.2 i2v) : exact, pod-validated ---
+diffusers==0.38.0
+transformers==5.10.2
+tokenizers==0.22.2
+accelerate==1.13.0
+peft==0.19.1
+safetensors==0.8.0rc1
+torchao==0.17.0           # fp8 quant for the keyframe + i2v paths. NOTE: torchao 0.17 logs
+                          # "skipping cpp extensions (needs torch>=2.11)" on the cu128/torch-2.7
+                          # line; the fp8 quant still runs correctly (validated sharp on H200) via
+                          # the Python path. Revisit a torch-2.7-matched torchao for the fast
+                          # fp8 cuda kernels as a speed follow-up (not a correctness blocker).
+imageio==2.37.3
+imageio-ffmpeg==0.6.0     # Wan frame export (diffusers.utils.export_to_video)
+ftfy==6.3.1               # Wan text prompt cleanup
+numpy==2.3.5
+Pillow==12.0.0
+PyYAML>=6.0               # contract.py storyboard parse (no version sensitivity)
+
+# --- identity stack (InstantID single-char upgrade) : PROVISIONAL FLOORS, not yet render-exercised ---
+# The validated renders used the masked IP-Adapter identity path; the InstantID upgrade has not
+# been run on a pod, so these stay floors until that path is validated.
+insightface>=0.7
+onnxruntime-gpu>=1.20
 sentencepiece>=0.2
 protobuf>=4.25
 
-# --- identity stack (InstantID single-char upgrade; antelopev2 face analysis) ---
-insightface>=0.7
-onnxruntime-gpu>=1.20
-
-# --- image / data ---
-Pillow>=10.0
-numpy>=1.26
-PyYAML>=6.0
-
-# --- serverless SDK + R2 object I/O ---
+# --- serverless SDK + R2 object I/O : floors (import-validated, not render-exercised) ---
 runpod>=1.6
 boto3>=1.34
