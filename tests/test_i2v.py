@@ -1,11 +1,13 @@
 """i2v's pure surface, tested on CPU: the frame-count math the temporal VAE constrains, the
 duration it realizes, and the tier->profile decision. The Wan generation body needs torch and is
 validated on a pod."""
+from vivijure_backend.config import FeatureCache
 from vivijure_backend.contract import Scene
 from vivijure_backend.i2v import (
     DEFAULT_FPS,
     MAX_FRAMES,
     I2VParams,
+    _set_feature_cache,
     _step_callback,
     clip_seconds,
     frames_for,
@@ -13,6 +15,76 @@ from vivijure_backend.i2v import (
     snap_frames,
 )
 from vivijure_backend.routing import QualityTier
+
+
+# ----------------------------------------------------------- feature cache install (item L)
+
+class _FakeTransformer:
+    def __init__(self):
+        self.disabled = 0
+    def disable_cache(self):
+        self.disabled += 1
+
+
+class _FakePipe:
+    def __init__(self):
+        self.transformer = _FakeTransformer()
+
+
+def _fake_diffusers_hooks(monkeypatch, applied):
+    import sys, types
+    diffusers = types.ModuleType("diffusers")
+    hooks = types.ModuleType("diffusers.hooks")
+
+    class FirstBlockCacheConfig:
+        def __init__(self, threshold):
+            self.threshold = threshold
+
+    def apply_first_block_cache(transformer, config):
+        applied["transformer"] = transformer
+        applied["threshold"] = config.threshold
+
+    hooks.FirstBlockCacheConfig = FirstBlockCacheConfig
+    hooks.apply_first_block_cache = apply_first_block_cache
+    diffusers.hooks = hooks
+    monkeypatch.setitem(sys.modules, "diffusers", diffusers)
+    monkeypatch.setitem(sys.modules, "diffusers.hooks", hooks)
+
+
+def test_feature_cache_none_resets_but_installs_nothing():
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.NONE)
+    assert pipe.transformer.disabled == 1            # always reset the prior shot's cache state
+
+
+def test_feature_cache_mixcache_installs_fbcache_with_final_threshold(monkeypatch):
+    applied = {}
+    _fake_diffusers_hooks(monkeypatch, applied)
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)
+    assert pipe.transformer.disabled == 1            # reset BEFORE install (no cross-shot leak)
+    assert applied["transformer"] is pipe.transformer
+    assert applied["threshold"] == 0.20              # final tier threshold
+
+
+def test_feature_cache_easycache_uses_a_more_conservative_threshold(monkeypatch):
+    applied = {}
+    _fake_diffusers_hooks(monkeypatch, applied)
+    _set_feature_cache(_FakePipe(), FeatureCache.EASYCACHE)
+    assert applied["threshold"] == 0.10
+
+
+def test_feature_cache_is_best_effort_when_the_cache_cannot_attach():
+    # No diffusers in the test venv -> the apply import raises; must be swallowed (run uncached),
+    # and the per-shot reset must still have fired.
+    pipe = _FakePipe()
+    _set_feature_cache(pipe, FeatureCache.MIXCACHE)   # must not raise
+    assert pipe.transformer.disabled == 1
+
+
+def test_feature_cache_tolerates_a_pipe_without_a_transformer():
+    class Bare: pass
+    _set_feature_cache(Bare(), FeatureCache.MIXCACHE)  # no transformer -> no-op, no raise
 
 
 # ----------------------------------------------------- per-step progress callback (item M)

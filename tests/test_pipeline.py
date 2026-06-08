@@ -49,6 +49,18 @@ def test_i2v_params_track_tier_and_scene_duration():
     assert draft.num_frames == 81   # 5*16=80 -> snapped to 81 (and at the ceiling)
 
 
+def test_i2v_params_carry_the_tier_feature_cache():
+    from vivijure_backend.config import FeatureCache
+    # The tier's denoise accelerator must reach the engine params (the gap item L closes).
+    assert i2v_params_from(RenderConfig.for_tier(QualityTier.FINAL),
+                           Scene(prompt="x")).feature_cache is FeatureCache.MIXCACHE
+    assert i2v_params_from(RenderConfig.for_tier(QualityTier.STANDARD),
+                           Scene(prompt="x")).feature_cache is FeatureCache.EASYCACHE
+    # draft has distill on, so config forced cache to NONE -> nothing to cache at 4 steps
+    assert i2v_params_from(RenderConfig.for_tier(QualityTier.DRAFT),
+                           Scene(prompt="x")).feature_cache is FeatureCache.NONE
+
+
 # ----------------------------------------------------------------- bundle + stub pipeline
 
 STORYBOARD = {

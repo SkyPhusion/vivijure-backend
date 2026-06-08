@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import FeatureCache
 from .contract import Scene
 from .routing import QualityTier
 
@@ -42,6 +43,7 @@ class I2VParams:
     height: int | None = None        # default: follow the keyframe's size
     width: int | None = None
     negative_prompt: str = "static, still, frozen, jpeg artifacts, blurry, watermark"
+    feature_cache: FeatureCache = FeatureCache.NONE  # final=MIXCACHE, standard=EASYCACHE, draft=NONE
 
 
 @dataclass
@@ -127,6 +129,7 @@ def animate(
 
     pipe = server.i2v_pipeline()
     _set_distill(pipe, cfg.distill)
+    _set_feature_cache(pipe, cfg.feature_cache)  # per-shot: reset + (re)install, never leak across shots
     step_callback = _step_callback(progress_cb, cfg.steps)
     frames = pipe(
         image=image, prompt=prompt, negative_prompt=cfg.negative_prompt,
@@ -160,6 +163,51 @@ def _step_callback(progress_cb, total: int):
         return callback_kwargs
 
     return on_step_end
+
+
+# FirstBlockCache thresholds per cache mode. FBCache (a TeaCache successor) skips the expensive
+# later DiT blocks when the first block's step-to-step output delta is below the threshold, reusing
+# the prior residual; a higher threshold skips more steps (faster, slightly lower fidelity). These
+# are starting points to tune on the pod for the speed/quality knee. The enum names are ours; the
+# mechanism is diffusers FirstBlockCache.
+_FBCACHE_THRESHOLD = {
+    FeatureCache.MIXCACHE: 0.20,   # final tier: aim ~1.5-2x
+    FeatureCache.EASYCACHE: 0.10,  # standard tier: more conservative
+}
+
+
+def _set_feature_cache(pipe, feature_cache) -> None:
+    """Install (or clear) the denoise feature cache on the Wan DiT for this shot.
+
+    The i2v pipe is a process-global reused across every shot (like the keyframe pipe), and the
+    cache accumulates per-timestep state within ONE shot, so it MUST reset each call or it leaks
+    across shots -- the per-scene-state bug class that bit keyframes in v0.1.4/v0.1.5. So always
+    clear any prior cache first, then (re)install a fresh one for the requested mode.
+
+    Mechanism: diffusers `apply_first_block_cache` (FirstBlockCache, the generic TeaCache successor
+    in `diffusers.hooks`). FasterCache / PyramidAttentionBroadcast are NOT wired for
+    WanTransformer3DModel (diffusers #11134), so FBCache is the supported path. NONE bypasses
+    entirely. Best-effort like `_set_distill`: if the cache cannot attach (API / Wan-support
+    mismatch), the shot runs full uncached rather than failing the render. POD-VALIDATE that it
+    actually attaches + speeds up on the fp8-quantized Wan DiT (not just a bf16 dev run), and that a
+    multi-shot render does not degrade shot-to-shot (proves the per-shot reset)."""
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is None:
+        return
+    try:
+        transformer.disable_cache()  # drop the previous shot's cache state (no cross-shot leak)
+    except Exception:
+        pass  # nothing installed yet
+    if feature_cache is FeatureCache.NONE:
+        return
+    try:
+        from diffusers.hooks import FirstBlockCacheConfig, apply_first_block_cache
+
+        threshold = _FBCACHE_THRESHOLD.get(feature_cache, 0.20)
+        apply_first_block_cache(transformer, FirstBlockCacheConfig(threshold=threshold))
+    except Exception as e:  # noqa: BLE001
+        print(f"i2v feature cache {getattr(feature_cache, 'value', feature_cache)} not applied "
+              f"({e}); running full uncached.", flush=True)
 
 
 def _set_distill(pipe, distill: bool) -> None:

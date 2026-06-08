@@ -63,8 +63,10 @@ def i2v_params_from(config: RenderConfig, scene) -> I2VParams:
     """Map the typed `I2VConfig` (+ the scene's duration) onto the i2v engine's `I2VParams`.
     Frame count is derived from the scene's target seconds at the config fps (snapped to the
     temporal VAE's 4k+1 by `i2v.frames_for`); `distill` selects the 4-step Lightning path and its
-    step/guidance profile. The config's `flow_shift` / `feature_cache` / `loader` are not yet
-    surfaced by `I2VParams` (the engine will grow them), so they are intentionally not mapped."""
+    step/guidance profile; `feature_cache` carries the tier's denoise accelerator (final=MIXCACHE,
+    standard=EASYCACHE, draft=NONE; `from_dict` already force-clears it to NONE under distill, so the
+    engine never sees a cache on a 4-step render). `flow_shift` / `loader` are still not surfaced by
+    `I2VParams` (lower-priority gaps), so they remain unmapped."""
     ic = config.i2v
     p = I2VParams(
         num_frames=frames_for(scene.target_seconds, ic.fps),
@@ -73,6 +75,7 @@ def i2v_params_from(config: RenderConfig, scene) -> I2VParams:
         guidance_scale=ic.guidance_scale,
         distill=ic.distill,
         seed=config.keyframe.seed,                 # one seed for the render; i2v has no own seed knob
+        feature_cache=ic.feature_cache,
     )
     if ic.negative_prompt:
         p.negative_prompt = ic.negative_prompt
