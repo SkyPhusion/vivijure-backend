@@ -1,0 +1,31 @@
+# Vivijure backend worker runtime stack.
+#
+# PROVISIONAL PINS. The exact version set (diffusers / transformers / torchao / imageio-ffmpeg +
+# the Wan / fp8 specifics) is being nailed down on the H100 i2v validation; the PM hands over the
+# validated list, which REPLACES the floors below. Keep this file the single source of the
+# version set so the image's dep layer stays reproducible. torch/torchvision/torchaudio are NOT
+# here: they install from the cu128 index in the Dockerfile (the Blackwell-safe CUDA line).
+
+# --- render engines (SDXL keyframe + Wan 2.2 i2v) ---
+diffusers>=0.35
+transformers>=4.46
+accelerate>=1.1
+peft>=0.13
+safetensors>=0.4
+torchao>=0.7              # fp8 (MXFP8 on Blackwell / fp8 on Hopper) for the keyframe + i2v paths
+imageio-ffmpeg>=0.5       # Wan frame export (diffusers.utils.export_to_video)
+sentencepiece>=0.2
+protobuf>=4.25
+
+# --- identity stack (InstantID single-char upgrade; antelopev2 face analysis) ---
+insightface>=0.7
+onnxruntime-gpu>=1.20
+
+# --- image / data ---
+Pillow>=10.0
+numpy>=1.26
+PyYAML>=6.0
+
+# --- serverless SDK + R2 object I/O ---
+runpod>=1.6
+boto3>=1.34

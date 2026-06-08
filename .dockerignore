@@ -1,0 +1,17 @@
+# The worker image COPYs only src/vivijure_backend + deploy/requirements.txt; everything else is
+# build-context noise. Keep the context tiny (fast uploads, no secrets/weights leaking into a layer).
+.git
+.venv
+**/__pycache__
+**/*.pyc
+tests
+scripts
+_smoke
+*.md
+.gitignore
+Jenkinsfile
+.pytest_cache
+*.safetensors
+*.png
+*.mp4
+*.tar.gz

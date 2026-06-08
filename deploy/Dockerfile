@@ -1,0 +1,77 @@
+# Vivijure backend serverless worker image (clean-room rewrite).
+#
+# This is OUR package (src/vivijure_backend), not the fork. The image is a thin GPU runtime:
+# it carries no model weights (the full set is hundreds of GB; a layer that size is rejected by
+# GHCR and ingests slowly). Instead a cold worker mirrors the kept models from R2 into the local
+# HF cache at startup via harness/models_mirror.ensure_models (rclone --links), then renders
+# offline; a warm worker reuses the on-disk cache. The only runtime credential is the R2 token,
+# delivered as endpoint env vars (never baked here).
+#
+# CUDA target: 12.8 + torch cu128. This is Blackwell-safe (RTX PRO 6000 / B200, sm_120/sm_100):
+# older cu124 builds raise "no kernel image is available for execution on the device" on those
+# cards, a failure deep into a job that looks like a model bug. NEVER downgrade the CUDA/torch
+# line. Any sm_70+ card (incl. the H100/H200 validation boxes) also runs cu128.
+#
+# Build context is the REPO ROOT (so `COPY src/...` resolves):
+#   docker build -f deploy/Dockerfile -t ghcr.io/skyphusion/vivijure-backend:<ver> .
+
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+# Python + the torch line are pinned here so a rebuild is reproducible. The torch spec is a
+# build ARG (cu128) so the exact patch can be bumped without editing the file body.
+ARG VJ_PYTHON_VERSION=3.11
+ARG VJ_TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG VJ_TORCH_SPEC="torch==2.7.* torchvision==0.22.* torchaudio==2.7.*"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/opt/conda/bin:$PATH \
+    PYTHONPATH=/opt/vivijure \
+    HF_HOME=/opt/models/hf-cache \
+    VJ_MODELS_ROOT=/opt/models \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# System deps: ffmpeg for the off-GPU finish + Wan video export, git/build basics, the libs
+# OpenCV / insightface (InstantID) need at import.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates ffmpeg libgl1 libglib2.0-0 build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# rclone for the R2 model mirror (ensure_models). The distro package is old; the --links
+# round-trip of the HF cache wants a current rclone.
+RUN curl -fsSL https://rclone.org/install.sh | bash
+
+# Python via Miniconda + conda-forge (NOT Anaconda's `defaults`, whose ToS blocks non-interactive
+# use and carries commercial terms). Only python + pip come from conda; the rest is pip.
+RUN curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/mc.sh \
+    && bash /tmp/mc.sh -b -p /opt/conda \
+    && rm /tmp/mc.sh \
+    && conda create -y -n vivijure -c conda-forge --override-channels "python=${VJ_PYTHON_VERSION}" pip \
+    && conda clean -afy
+
+# Run everything in the vivijure env from here on.
+SHELL ["conda", "run", "--no-capture-output", "-n", "vivijure", "/bin/bash", "-c"]
+
+# PyTorch (cu128) first so it layer-caches independently of the app deps.
+RUN python -m pip install --upgrade pip wheel setuptools \
+    && python -m pip install --index-url "${VJ_TORCH_INDEX}" ${VJ_TORCH_SPEC}
+
+# Runtime stack (render engines + serverless SDK + R2). Exact pins are finalized from the H100
+# i2v validation and live in deploy/requirements.txt; keep that file the single source of the
+# version set so this layer is reproducible.
+COPY deploy/requirements.txt /tmp/requirements.txt
+RUN python -m pip install -r /tmp/requirements.txt
+
+# Our package. src/ layout -> /opt/vivijure/vivijure_backend, on PYTHONPATH.
+WORKDIR /opt/vivijure
+COPY src/vivijure_backend /opt/vivijure/vivijure_backend
+
+# Model + sentinel root the cold-start mirror populates (HF_HOME lives under it).
+RUN mkdir -p /opt/models/hf-cache
+
+# The container's main process: the RunPod serverless loop (worker.main ->
+# runpod.serverless.start({"handler": worker.handler})). The handler registers the per-job
+# GpuPipeline and delegates to the harness (model mirror, R2, plan, finish).
+CMD ["conda", "run", "--no-capture-output", "-n", "vivijure", "python", "-u", "-m", "vivijure_backend.worker"]

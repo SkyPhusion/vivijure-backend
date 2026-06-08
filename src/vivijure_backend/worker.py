@@ -40,3 +40,16 @@ def handler(job: dict) -> dict:
     payload = job.get("input", job)
     register_pipeline(build_pipeline(RenderRequest.from_dict(payload)))
     return harness_handler(job)
+
+
+def main() -> None:
+    """The container's main process: start the RunPod serverless loop with our handler. The
+    `runpod` SDK import is deferred so this module stays CPU/dep-light for tests; the worker
+    image installs it. `python -m vivijure_backend.worker` runs this."""
+    import runpod  # the worker image's serverless SDK
+
+    runpod.serverless.start({"handler": handler})
+
+
+if __name__ == "__main__":
+    main()
