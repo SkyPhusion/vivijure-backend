@@ -112,7 +112,7 @@ def train_slot(
     from diffusers.utils import convert_state_dict_to_diffusers
     from peft import LoraConfig
     from peft.utils import get_peft_model_state_dict
-    from transformers import AutoTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+    from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -124,8 +124,12 @@ def train_slot(
     # The VAE stays fp32 because SDXL's VAE produces NaNs under fp16/bf16 encode; everything
     # else lives in bf16. Only the UNet gets a trainable LoRA; the rest is inference-only.
     vae = AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=torch.float32).to(device)
-    tokenizer_one = AutoTokenizer.from_pretrained(base, subfolder="tokenizer", use_fast=False)
-    tokenizer_two = AutoTokenizer.from_pretrained(base, subfolder="tokenizer_2", use_fast=False)
+    # CLIPTokenizer, not AutoTokenizer: Auto* probes AutoConfig for a config.json the CLIP
+    # tokenizer subfolders do not have, which is a graceful 404 online but a FATAL
+    # LocalEntryNotFoundError under HF_HUB_OFFLINE=1 on the deployed worker. CLIPTokenizer loads
+    # the tokenizer files directly (the diffusers SDXL path), so it works offline from the cache.
+    tokenizer_one = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer")
+    tokenizer_two = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer_2")
     text_encoder_one = CLIPTextModel.from_pretrained(
         base, subfolder="text_encoder", torch_dtype=weight_dtype).to(device)
     text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
