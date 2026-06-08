@@ -139,6 +139,23 @@ def test_null_emitter_train_cb_is_none():
     assert NullEmitter().train_step_cb("A") is None   # pipeline passes None -> lora_train no-ops
 
 
+def test_i2v_step_cb_emits_every_step():
+    store = RecordingStore()
+    e = _emitter(store)
+    cb = e.i2v_step_cb("shot_01")
+    cb(12, 40)
+    rec = json.loads(store.objects[keys.progress_log_key("neon rain", "job-1")].decode().strip())
+    assert rec["event"] == "i2v_step" and rec["shot"] == "shot_01"
+    assert rec["step"] == 12 and rec["total"] == 40
+    # i2v_step is counted in the snapshot (like train_step), so /progress shows it climbing
+    snap = json.loads(store.objects[keys.progress_snapshot_key("neon rain", "job-1")])
+    assert snap["counts"]["i2v_step"] == 1
+
+
+def test_null_emitter_i2v_cb_is_none():
+    assert NullEmitter().i2v_step_cb("shot_01") is None  # pipeline passes None -> i2v omits the hook
+
+
 def test_read_snapshot_round_trips_and_tolerates_missing():
     store = RecordingStore()
     _emitter(store).emit("started")

@@ -6,12 +6,37 @@ from vivijure_backend.i2v import (
     DEFAULT_FPS,
     MAX_FRAMES,
     I2VParams,
+    _step_callback,
     clip_seconds,
     frames_for,
     params_for,
     snap_frames,
 )
 from vivijure_backend.routing import QualityTier
+
+
+# ----------------------------------------------------- per-step progress callback (item M)
+
+def test_step_callback_reports_one_based_step_and_passes_kwargs_through():
+    seen = []
+    cb = _step_callback(lambda step, total: seen.append((step, total)), 40)
+    kw = {"latents": "opaque"}
+    out = cb(None, 11, 0, kw)          # diffusers signature: (pipe, step_index, timestep, kwargs)
+    assert seen == [(12, 40)]          # reported 1-based: step_index 11 -> step 12 of 40
+    assert out is kw                   # callback_kwargs returned unchanged, loop unaffected
+
+
+def test_step_callback_is_none_without_a_progress_cb():
+    # No cb -> None, so animate omits callback_on_step_end entirely (zero overhead).
+    assert _step_callback(None, 40) is None
+
+
+def test_step_callback_swallows_a_failing_progress_cb():
+    def boom(step, total):
+        raise RuntimeError("progress write failed")
+    cb = _step_callback(boom, 4)
+    kw = {"latents": 1}
+    assert cb(None, 0, 0, kw) is kw    # must not raise; render continues
 
 
 def _scene(target=None):

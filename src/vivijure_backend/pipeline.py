@@ -125,9 +125,11 @@ class GpuPipeline:
         ).path
 
     def _animate(self, scene, keyframe_path: Path, prompt: str, out_path: Path) -> Path:
+        # Per-step i2v progress (every step; i2v is 4-40 steps, ~30s/step at final tier).
+        cb = self.progress.i2v_step_cb(scene.id)
         return _i2v.animate(
             scene, keyframe_path, prompt, self._model_server(), out_path,
-            params=i2v_params_from(self.config, scene),
+            params=i2v_params_from(self.config, scene), progress_cb=cb,
         ).path
 
     # --- orchestration (CPU; the stages above are the only GPU touch points) ---

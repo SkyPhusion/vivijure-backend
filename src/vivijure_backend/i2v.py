@@ -101,12 +101,18 @@ def animate(
     out_path: Path,
     *,
     params: I2VParams | None = None,
+    progress_cb=None,
 ) -> I2VResult:
     """Animate `keyframe` into a clip at `out_path` for one scene.
 
     `server` is a `models.ModelServer` (provides the Wan i2v pipeline with the Lightning distill
     LoRA). The keyframe is the first frame; `prompt` describes the motion. Heavy imports are
     deferred; the body is validated on a pod.
+
+    `progress_cb(step, total)`, when given, is called once per denoise step (i2v is the long pole;
+    at final tier each step is ~30s, so the live `step/total` is what distinguishes a slow shot
+    from a hung one). It is wired through diffusers' `callback_on_step_end` hook, best-effort: a
+    progress failure never breaks the render.
     """
     cfg = params or I2VParams()
     out_path = Path(out_path)
@@ -121,11 +127,13 @@ def animate(
 
     pipe = server.i2v_pipeline()
     _set_distill(pipe, cfg.distill)
+    step_callback = _step_callback(progress_cb, cfg.steps)
     frames = pipe(
         image=image, prompt=prompt, negative_prompt=cfg.negative_prompt,
         height=height, width=width, num_frames=cfg.num_frames,
         num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
         generator=torch.Generator(device="cuda").manual_seed(cfg.seed),
+        **({"callback_on_step_end": step_callback} if step_callback else {}),
     ).frames[0]
 
     export_to_video(frames, str(out_path), fps=cfg.fps)
@@ -133,6 +141,25 @@ def animate(
         shot_id=scene.id or "shot", path=out_path, num_frames=cfg.num_frames,
         fps=cfg.fps, seconds=clip_seconds(cfg.num_frames, cfg.fps), distilled=cfg.distill,
     )
+
+
+def _step_callback(progress_cb, total: int):
+    """Wrap a `(step, total)` progress callback in diffusers' `callback_on_step_end` signature
+    `(pipe, step_index, timestep, callback_kwargs) -> dict`. Returns None when there is no callback,
+    so the pipe call omits the kwarg entirely (zero overhead). The callback is best-effort: a
+    progress failure is swallowed and never breaks the denoise, and `callback_kwargs` is returned
+    unchanged so diffusers' loop is unaffected."""
+    if progress_cb is None:
+        return None
+
+    def on_step_end(pipe, step_index, timestep, callback_kwargs):
+        try:
+            progress_cb(step_index + 1, total)  # step_index is 0-based; report 1..total
+        except Exception:
+            pass
+        return callback_kwargs
+
+    return on_step_end
 
 
 def _set_distill(pipe, distill: bool) -> None:

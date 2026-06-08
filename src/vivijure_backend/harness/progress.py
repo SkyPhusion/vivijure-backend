@@ -33,7 +33,8 @@ from typing import Any, Callable
 from . import keys
 
 # Events whose occurrences we count in the snapshot (the others are lifecycle: started/complete).
-_COUNTED = ("train_done", "keyframe_done", "i2v_done", "assemble_done", "upload_done", "train_step")
+_COUNTED = ("train_done", "keyframe_done", "i2v_done", "assemble_done", "upload_done",
+            "train_step", "i2v_step")
 
 
 class ProgressEmitter:
@@ -80,6 +81,15 @@ class ProgressEmitter:
         def cb(step: int, total: int, loss: float) -> None:
             self.emit("train_step", slot=slot, step=int(step), total=int(total),
                       loss=round(float(loss), 4))
+        return cb
+
+    def i2v_step_cb(self, shot: str) -> Callable[[int, int], None]:
+        """A per-step i2v callback for `i2v.animate` to call inside the Wan denoise loop. Unlike
+        training (1000 steps, throttled every 50), i2v is 4 (draft) to 40 (final) steps at ~30s/step
+        on the final tier, so it emits EVERY step: ~40 events naturally paced ~30s apart, the live
+        signal that distinguishes a slow i2v from a hung one without SSHing the worker."""
+        def cb(step: int, total: int) -> None:
+            self.emit("i2v_step", shot=shot, step=int(step), total=int(total))
         return cb
 
     # --- internals (every one best-effort) ---
@@ -138,6 +148,7 @@ class NullEmitter:
     def complete(self, *a, **k) -> None: pass
     def error(self, *a, **k) -> None: pass
     def train_step_cb(self, slot: str): return None
+    def i2v_step_cb(self, shot: str): return None
 
 
 def read_snapshot(store, project: str, job_id: str) -> dict | None:

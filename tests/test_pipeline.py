@@ -273,3 +273,32 @@ def test_run_job_refuses_to_drop_staged_loras_a_pipeline_cannot_receive(tmp_path
                  "render_overrides": {"finish_offloaded": True}},
                 pipeline=NoSetterPipeline(), store=StagingStore(tmp_path / "b.tar.gz"),
                 workdir=tmp_path / "work", job_id="j")
+
+
+# -------------------------------------------------- i2v per-step progress wiring (item M)
+
+def test_animate_wires_per_step_i2v_progress(tmp_path, monkeypatch):
+    # GpuPipeline._animate must hand i2v.animate a progress_cb bound to this shot that emits
+    # i2v_step -- so the snapshot ticks step/total during the long full-step i2v.
+    from vivijure_backend import i2v as i2v_mod
+    from vivijure_backend.harness.progress import ProgressEmitter
+
+    captured = {}
+
+    def fake_animate(scene, keyframe, prompt, server, out_path, *, params=None, progress_cb=None):
+        captured["cb"] = progress_cb
+        class R: path = out_path
+        return R()
+    monkeypatch.setattr(i2v_mod, "animate", fake_animate)
+
+    pipe = GpuPipeline(config=RenderConfig.for_tier(QualityTier.FINAL), server=object())
+    emitter = ProgressEmitter(None, "neon", "j")     # store=None: emit accumulates in-memory
+    pipe.set_progress(emitter)
+    pipe._animate(Scene(prompt="x", id="shot_01"), tmp_path / "kf.png", "motion", tmp_path / "out.mp4")
+
+    cb = captured["cb"]
+    assert callable(cb)                              # a real per-step callback was wired
+    cb(7, 40)                                        # diffusers would call this once per step
+    last = emitter._events[-1]
+    assert last["event"] == "i2v_step" and last["shot"] == "shot_01"
+    assert last["step"] == 7 and last["total"] == 40
