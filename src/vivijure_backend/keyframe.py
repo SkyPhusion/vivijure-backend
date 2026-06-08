@@ -168,8 +168,10 @@ def _render_single(pipe, prompt, scene, cast, cfg, loras, generator):
 
     ip_images = _ref_images(cast, slot, count=1) if slot else None
     if ip_images:
-        _ensure_ip_adapter(pipe)
+        _ensure_ip_adapter(pipe, 1)
         pipe.set_ip_adapter_scale(cfg.ip_adapter_scale)
+    else:
+        _ensure_ip_adapter(pipe, 0)  # clear any IP-Adapter a prior scene left on the shared pipe
     return pipe(
         prompt=prompt, negative_prompt=cfg.negative_prompt,
         num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
@@ -256,15 +258,24 @@ def _adapter_names(pipe) -> list[str]:
 
 
 def _ensure_ip_adapter(pipe, n: int = 1):
-    """Attach the SDXL IP-Adapter once (n encoders for n regional identities). The repo id mirrors
-    models.DEFAULT_SPECS[IP_ADAPTER]."""
-    if getattr(pipe, "_vj_ip_loaded", 0) >= n:
+    """Bring the shared keyframe pipe to EXACTLY n IP-Adapter encoders (n=0 clears it).
+
+    The pipe is process-global across scenes, so a prior regional scene can leave 2 encoders
+    attached while a later single-character scene needs 1. set_ip_adapter_scale and the call-time
+    ip_adapter_image must both match the loaded count, or diffusers raises ("Cannot assign 1
+    scale_configs to 2 IP-Adapter"). So reload whenever the count differs in either direction (not
+    only when fewer are present, the old `>= n` bug), and unload entirely for a no-character scene."""
+    if getattr(pipe, "_vj_ip_loaded", 0) == n:
         return
-    from .models import DEFAULT_SPECS, ModelRole
-    repo = DEFAULT_SPECS[ModelRole.IP_ADAPTER].repo_id
-    pipe.load_ip_adapter(repo, subfolder="sdxl_models",
-                         weight_name=["ip-adapter_sdxl.safetensors"] * n if n > 1 else "ip-adapter_sdxl.safetensors")
-    pipe._vj_ip_loaded = n
+    if getattr(pipe, "_vj_ip_loaded", 0):
+        pipe.unload_ip_adapter()
+        pipe._vj_ip_loaded = 0
+    if n:
+        from .models import DEFAULT_SPECS, ModelRole
+        repo = DEFAULT_SPECS[ModelRole.IP_ADAPTER].repo_id
+        pipe.load_ip_adapter(repo, subfolder="sdxl_models",
+                             weight_name=["ip-adapter_sdxl.safetensors"] * n if n > 1 else "ip-adapter_sdxl.safetensors")
+        pipe._vj_ip_loaded = n
 
 
 def _ref_images(cast, slot, count: int):

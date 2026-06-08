@@ -7,6 +7,7 @@ from vivijure_backend.keyframe import (
     DEFAULT_LORA_SCALE,
     KeyframeParams,
     _bind_loras,
+    _ensure_ip_adapter,
     build_prompt,
     engine_for,
     region_boxes,
@@ -149,3 +150,60 @@ def test_bind_loras_clears_identity_for_a_no_character_scene():
     _bind_loras(pipe, {"A": "a.safetensors"}, 0.3)
     _bind_loras(pipe, {}, 0.3)                        # a scene with no character
     assert pipe.adapters == []                        # prior identity does not leak in
+
+
+# ------------------------------------------------------------- IP-Adapter count (shared pipe)
+
+class _FakeIPPipe:
+    """Tracks the IP-Adapter encoder count the way diffusers' set_ip_adapter_scale validates it:
+    a scalar or a list whose length matches the loaded count is fine; a mismatch raises exactly as
+    the worker did ("Cannot assign N scale_configs to M IP-Adapter")."""
+    def __init__(self):
+        self.ip_count = 0
+        self.ip_scale = None
+
+    def load_ip_adapter(self, repo, subfolder, weight_name):
+        self.ip_count = len(weight_name) if isinstance(weight_name, list) else 1
+
+    def unload_ip_adapter(self):
+        self.ip_count = 0
+
+    def set_ip_adapter_scale(self, scale):
+        k = len(scale) if isinstance(scale, list) else 1
+        if self.ip_count == 0 or k != self.ip_count:
+            raise ValueError(f"Cannot assign {k} scale_configs to {self.ip_count} IP-Adapter.")
+        self.ip_scale = scale
+
+
+def test_ip_adapter_shrinks_from_regional_to_single():
+    # The exact bug that failed the deployed render: a 2-char scene left 2 encoders, then a single
+    # scene set a scalar scale -> "Cannot assign 1 scale_configs to 2 IP-Adapter".
+    pipe = _FakeIPPipe()
+    _ensure_ip_adapter(pipe, 2)        # regional scene
+    assert pipe.ip_count == 2
+    _ensure_ip_adapter(pipe, 1)        # next scene single -> must reduce to exactly 1
+    assert pipe.ip_count == 1
+    pipe.set_ip_adapter_scale(0.7)     # scalar now matches the single encoder (no raise)
+
+
+def test_ip_adapter_grows_from_single_to_regional():
+    pipe = _FakeIPPipe()
+    _ensure_ip_adapter(pipe, 1)
+    _ensure_ip_adapter(pipe, 2)        # single -> regional, must grow to 2
+    assert pipe.ip_count == 2
+    pipe.set_ip_adapter_scale([0.7, 0.7])   # list of 2 matches
+
+
+def test_ip_adapter_clears_for_no_character_scene():
+    pipe = _FakeIPPipe()
+    _ensure_ip_adapter(pipe, 2)
+    _ensure_ip_adapter(pipe, 0)        # a no-character scene drops all encoders
+    assert pipe.ip_count == 0
+
+
+def test_ip_adapter_noop_when_count_unchanged():
+    pipe = _FakeIPPipe()
+    _ensure_ip_adapter(pipe, 1)
+    first = pipe.ip_count
+    _ensure_ip_adapter(pipe, 1)        # same count -> no reload churn
+    assert pipe.ip_count == first == 1
