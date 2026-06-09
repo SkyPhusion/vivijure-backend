@@ -206,12 +206,17 @@ class RenderRequest:
     overrides: dict[str, Any] = field(default_factory=dict)  # raw render_overrides; routing flags only
     pretrained_loras: dict[str, str] = field(default_factory=dict)
     process_shot_ids: list[str] | None = None  # finalize / regen subset
+    # The Access-authenticated user who submitted the job. Stamped as customMetadata.user_email on
+    # every uploaded artifact so the control plane's ownership-gated /api/artifact route can serve
+    # them back; None for a local/test run leaves uploads untagged.
+    user_email: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RenderRequest":
         from .config import RenderConfig
         overrides = d.get("render_overrides") if isinstance(d.get("render_overrides"), dict) else {}
         quality_tier = _str(d.get("quality_tier"), "final")
+        ue = d.get("user_email")
         return cls(
             action=_str(d.get("action"), "render"),
             project=_str(d.get("project"), "untitled"),
@@ -221,6 +226,7 @@ class RenderRequest:
             overrides=overrides,
             pretrained_loras=d.get("pretrained_loras") if isinstance(d.get("pretrained_loras"), dict) else {},
             process_shot_ids=d.get("process_shot_ids") if isinstance(d.get("process_shot_ids"), list) else None,
+            user_email=ue.strip() if isinstance(ue, str) and ue.strip() else None,
         )
 
 

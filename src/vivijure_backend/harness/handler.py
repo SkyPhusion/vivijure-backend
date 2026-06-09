@@ -177,17 +177,24 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     progress = progress or NullEmitter()
     project = req.project
     result = RenderResult(project=project)
+    # Stamp the owner on every uploaded artifact. The control plane's /api/artifact route 403s
+    # any object whose customMetadata.user_email != the caller, so without this the user cannot
+    # fetch back their own keyframes/clips/mp4 (they render fine, then show blank in the UI). The
+    # control plane sends user_email in the job input; the contract now parses it. None when absent
+    # (e.g. a local/test run) leaves uploads untagged exactly as before.
+    owner_meta = {"user_email": req.user_email} if req.user_email else None
 
     # LoRA adapters: upload trained ones, pass pretrained through.
     for slot, path in outputs.loras.items():
-        key = store.put_file(Path(path), keys.lora_key(project, slot))
+        key = store.put_file(Path(path), keys.lora_key(project, slot), metadata=owner_meta)
         result.lora[slot] = {"lora_id": key}
     for slot, lora_id in req.pretrained_loras.items():
         result.lora.setdefault(slot, {"lora_id": lora_id})
 
     # Keyframes: upload whatever the stage drew.
     for shot_id, path in outputs.keyframes.items():
-        key = store.put_file(Path(path), keys.keyframe_key(project, shot_id), content_type="image/png")
+        key = store.put_file(Path(path), keys.keyframe_key(project, shot_id),
+                             content_type="image/png", metadata=owner_meta)
         result.keyframes.append(Keyframe(shot_id=shot_id, key=key))
 
     # Clips ordered by the storyboard (never the stage's incidental order).
@@ -198,13 +205,14 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     if offloaded:
         # Off-GPU finish elsewhere: emit per-shot clips + a manifest, no merge here.
         for c in ordered:
-            key = store.put_file(c.path, keys.clip_key(project, c.shot_id), content_type="video/mp4")
+            key = store.put_file(c.path, keys.clip_key(project, c.shot_id),
+                                 content_type="video/mp4", metadata=owner_meta)
             result.clips.append(Clip(shot_id=c.shot_id, key=key))
         manifest = build_manifest(ordered, output_name="full.mp4",
                                   audio=str(outputs.audio) if outputs.audio else None)
         man_path = write_manifest(manifest, workdir / "manifest.json")
         man_key = keys.join("renders", project, "manifest.json")
-        store.put_file(man_path, man_key, content_type="application/json")
+        store.put_file(man_path, man_key, content_type="application/json", metadata=owner_meta)
         progress.emit("assemble_done", offloaded=True, clips=len(ordered))
         progress.emit("upload_done", key=man_key)
     elif ordered or outputs.final_video:
@@ -212,14 +220,15 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
         final = Path(outputs.final_video) if outputs.final_video else \
             assemble(ordered, workdir / "full.mp4", audio=outputs.audio).output_path
         from ..assemble import probe_duration, probe_has_audio
-        result.output_key = store.put_file(final, keys.output_key(project), content_type="video/mp4")
+        result.output_key = store.put_file(final, keys.output_key(project),
+                                           content_type="video/mp4", metadata=owner_meta)
         result.seconds = probe_duration(final)
         result.has_audio = probe_has_audio(final)
         progress.emit("assemble_done", offloaded=False, seconds=result.seconds)
         progress.emit("upload_done", key=result.output_key)
 
     # Project state for the next incremental render.
-    result.state_key = store.put_dir_as_tar(bundle.root, keys.state_key(project))
+    result.state_key = store.put_dir_as_tar(bundle.root, keys.state_key(project), metadata=owner_meta)
     progress.emit("upload_done", key=result.state_key)
     return result
 

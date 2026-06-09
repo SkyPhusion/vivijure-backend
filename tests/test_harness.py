@@ -91,6 +91,7 @@ class FakeStore:
         self.bundle_tar = bundle_tar
         self.puts: list[str] = []
         self.tars: list[str] = []
+        self.meta: dict[str, dict | None] = {}  # key -> customMetadata recorded at put time
 
     def get_file(self, key, dest):
         shutil.copy(self.bundle_tar, dest)
@@ -99,10 +100,12 @@ class FakeStore:
     def put_file(self, path, key, *, content_type=None, metadata=None):
         assert Path(path).exists(), f"uploading a nonexistent file: {path}"
         self.puts.append(key)
+        self.meta[key] = metadata
         return key
 
     def put_dir_as_tar(self, src_dir, key, *, metadata=None):
         self.tars.append(key)
+        self.meta[key] = metadata
         return key
 
 
@@ -146,6 +149,27 @@ def test_run_job_offloaded_emits_clips_and_manifest(tmp_path):
     assert res["state_key"] == "projects/neon/state.tar.gz"
     # keyframes uploaded for both generated shots
     assert {k["shot_id"] for k in res["keyframes"]} == {"shot_01", "shot_02"}
+
+
+def test_run_job_stamps_user_email_on_every_artifact(tmp_path):
+    store = FakeStore(_bundle_tar(tmp_path / "b.tar.gz"))
+    res = run_job(_job(user_email="conrad@rockenhaus.net",
+                       render_overrides={"finish_offloaded": True}),
+                  pipeline=FakePipeline(), store=store, workdir=tmp_path / "work")
+    owner = {"user_email": "conrad@rockenhaus.net"}
+    # every uploaded artifact (trained LoRA, keyframes, clips, manifest) + the state tar carries
+    # the owner tag, so /api/artifact (which 403s a mismatched/absent tag) can serve them back.
+    assert store.puts, "expected uploads"
+    untagged = {k: store.meta[k] for k in store.puts if store.meta[k] != owner}
+    assert not untagged, f"these uploads were not owner-stamped: {untagged}"
+    assert store.meta[res["state_key"]] == owner
+
+
+def test_run_job_without_user_email_leaves_artifacts_untagged(tmp_path):
+    store = FakeStore(_bundle_tar(tmp_path / "b.tar.gz"))
+    run_job(_job(render_overrides={"finish_offloaded": True}),
+            pipeline=FakePipeline(), store=store, workdir=tmp_path / "work")
+    assert store.puts and all(store.meta[k] is None for k in store.puts)
 
 
 def test_run_job_rejects_invalid_storyboard(tmp_path):
