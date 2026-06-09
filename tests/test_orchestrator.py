@@ -99,6 +99,28 @@ def test_finalize_is_i2v_only_over_reused_keyframes():
     assert p.shots_to_animate == 2
 
 
+def test_preview_is_keyframes_only_with_training():
+    # The keyframes-only preview: train the LoRAs + draw every keyframe, but NO i2v and no MP4
+    # (so the user can eyeball shots before committing GPU-seconds to Wan motion).
+    p = plan(_req(action="preview"), _sb(TWO_SCENES))
+    assert p.action is Action.PREVIEW
+    assert sorted(p.lora.train) == ["A", "B"]          # untrained slots still train for a true preview
+    assert p.keyframes_to_generate == 2                # all keyframes drawn
+    assert p.shots_to_animate == 0                     # but nothing animated
+    assert all(not s.needs_i2v for s in p.scenes)
+    assert all(s.i2v_tier is None for s in p.scenes)   # no GPU tier reserved for motion
+
+
+def test_preview_reuses_ready_lora_instead_of_retraining():
+    # With the cast LoRA already trained/pretrained, a preview must reuse it (the bug that made a
+    # cold preview retrain Marcus/Aria was a control-plane reuse miss, not a planner one).
+    p = plan(_req(action="preview", pretrained_loras={"A": "loras/cast-3/x.safetensors"}),
+             _sb(TWO_SCENES))
+    assert "A" in p.lora.reuse
+    assert p.lora.train == ["B"]
+    assert p.shots_to_animate == 0
+
+
 def test_regen_shot_is_keyframe_only_no_i2v():
     p = plan(_req(action="regen_shot"), _sb(TWO_SCENES))
     assert p.shots_to_animate == 0

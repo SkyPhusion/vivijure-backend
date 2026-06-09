@@ -34,6 +34,7 @@ MULTI_CHAR_DEFAULTS: dict[str, object] = {
 
 class Action(str, Enum):
     RENDER = "render"          # full pipeline: train -> keyframes -> i2v -> assemble
+    PREVIEW = "preview"        # keyframes-only preview: train -> keyframes, NO i2v, no MP4
     FINALIZE = "finalize"      # i2v over existing keyframes (no keyframe gen)
     REGEN_SHOT = "regen_shot"  # regenerate named keyframes only, no i2v
     TRAIN_LORA = "train_lora"  # train LoRAs only
@@ -161,8 +162,11 @@ def plan(
     lora = LoraPlan(train=to_train, reuse=reused)
 
     # --- per-scene keyframe + i2v plan ---
+    # PREVIEW is RENDER minus motion: it draws keyframes (and trains the LoRAs they need, since
+    # to_train above is only zeroed for FINALIZE) but never runs i2v, so `_finish` assembles no
+    # MP4 (no clips) and the user gets a keyframe preview before committing GPU-seconds to Wan.
     want_i2v = action in (Action.RENDER, Action.FINALIZE)
-    want_keyframe = action in (Action.RENDER, Action.REGEN_SHOT)
+    want_keyframe = action in (Action.RENDER, Action.PREVIEW, Action.REGEN_SHOT)
     # A train-only job (neither keyframe nor i2v) has no per-scene render: building scene
     # plans would estimate keyframe GPU-seconds for work that never fires, which is exactly
     # the wasteful over-estimate this planner exists to prevent.
