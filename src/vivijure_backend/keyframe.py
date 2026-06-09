@@ -235,6 +235,19 @@ def _bind_loras(pipe, slot_paths: dict, scale: float) -> list[str]:
     loaded = []
     for slot, path in slot_paths.items():
         pipe.load_lora_weights(str(path), adapter_name=slot)
+        # diffusers silently loads ZERO modules when the safetensors keys do not match the pipe's
+        # convention (e.g. a raw PEFT, unet-only state dict with no `unet.` prefix and lora_A/lora_B
+        # naming, as the standalone cast trainer writes). Left unchecked the slot never registers and
+        # set_adapters below explodes with an opaque "not in the list of present adapters: set()".
+        # Fail fast and loud: a staged LoRA that registers nothing would otherwise silently render
+        # the character without its identity adapter, the exact silent-wrong-identity outcome the
+        # harness staging already guards against.
+        if slot not in _adapter_names(pipe):
+            raise ValueError(
+                f"LoRA for slot {slot!r} ({path}) registered no adapter: its safetensors keys did "
+                f"not match the diffusers convention (expected a 'unet.'-prefixed lora.down/up state "
+                f"dict; load_lora_weights ignored what it was given). Refusing to render the "
+                f"character without its identity adapter.")
         loaded.append(slot)
     if loaded:
         names = base + loaded

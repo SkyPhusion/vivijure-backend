@@ -13,6 +13,7 @@ from vivijure_backend.keyframe import (
     region_boxes,
     slot_trigger,
 )
+import pytest
 
 CAST = Cast.from_registry({"characters": {
     "A": {"name": "Vesper", "prompt": "teal-haired netrunner"},
@@ -135,6 +136,21 @@ def test_bind_loras_reuses_slot_across_scenes_on_shared_pipe():
     _bind_loras(pipe, {"A": "a.safetensors"}, 0.3)  # next scene, slot A again -> no raise
     assert pipe.adapters == ["A"]                   # B from the prior scene was cleared
     assert pipe.active == [("A", 0.3)]
+
+
+class _NoRegisterPipe(_FakePipe):
+    """`load_lora_weights` accepts the file but registers nothing -- exactly what diffusers does
+    when the safetensors keys do not match its convention (the cast trainer's raw PEFT, no-`unet.`-
+    prefix format that crashed the first real LoRA-reuse render)."""
+    def load_lora_weights(self, path, adapter_name):
+        pass  # silently loads zero modules; no adapter registered
+
+
+def test_bind_loras_fails_loud_when_a_lora_registers_no_adapter():
+    with pytest.raises(ValueError, match="registered no adapter"):
+        _bind_loras(_NoRegisterPipe(), {"A": "a.safetensors"}, 0.3)
+    # the base-only / no-character case must NOT raise (nothing to load, nothing to check)
+    assert _bind_loras(_NoRegisterPipe(), {}, 0.3) == []
 
 
 def test_bind_loras_keeps_base_distill_adapter_across_scenes():
