@@ -8,6 +8,7 @@ from vivijure_backend.keyframe import (
     KeyframeParams,
     _bind_loras,
     _ensure_ip_adapter,
+    _pose_skeleton,
     build_prompt,
     engine_for,
     region_boxes,
@@ -73,6 +74,26 @@ def test_last_region_absorbs_odd_remainder():
 def test_horizontal_orientation_stacks():
     boxes = region_boxes(512, 1024, 2, orientation="horizontal")
     assert boxes == [(0, 0, 512, 512), (0, 512, 512, 1024)]
+
+
+def test_region_gutter_carves_a_dead_band_between_regions():
+    (l0, t0, r0, b0), (l1, t1, r1, b1) = region_boxes(1024, 1024, 2, gutter=64)
+    assert l0 == 0 and r1 == 1024          # outer canvas edges stay flush
+    assert r0 == 512 - 32 and l1 == 512 + 32  # interior edges inset by gutter//2
+    assert l1 - r0 == 64                    # a 64px dead band the masks cannot blend across
+    # gutter=0 reproduces the old adjacent split exactly
+    assert region_boxes(1024, 1024, 2, gutter=0) == [(0, 0, 512, 1024), (512, 0, 1024, 1024)]
+
+
+def test_pose_skeleton_plants_one_figure_per_region():
+    boxes = region_boxes(512, 512, 2, gutter=64)
+    img = _pose_skeleton(512, 512, boxes)
+    assert img.size == (512, 512)
+    # a distinct figure drawn in EACH half (getbbox() is None only for an all-black crop)
+    assert img.crop((0, 0, 256, 512)).getbbox() is not None
+    assert img.crop((256, 0, 512, 512)).getbbox() is not None
+    # the n=1 single-figure case stays centered and non-empty
+    assert _pose_skeleton(512, 512, region_boxes(512, 512, 1)).getbbox() is not None
 
 
 # ----------------------------------------------------------------------- engine path choice

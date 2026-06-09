@@ -136,6 +136,7 @@ class MultiCharConfig:
     ip_adapter_scale_per_slot: float = 0.7    # 0..1; per-region masked IP-Adapter identity pull
     max_slots: int = 2                        # 1..4; characters the no-bleed path supports at once
     controlnet_pose_scale: float = 0.55       # 0..1.5; OpenPose ControlNet conditioning scale
+    region_gutter: int = 64                   # 0..256 px dead band between regional masks (anti seam-blend)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "MultiCharConfig":
@@ -148,6 +149,7 @@ class MultiCharConfig:
             ip_adapter_scale_per_slot=_clamp(d.get("ip_adapter_scale_per_slot"), 0.0, 1.0, base.ip_adapter_scale_per_slot),
             max_slots=_clamp_int(d.get("max_slots"), 1, 4, base.max_slots),
             controlnet_pose_scale=_clamp(d.get("controlnet_pose_scale"), 0.0, 1.5, base.controlnet_pose_scale),
+            region_gutter=_clamp_int(d.get("region_gutter"), 0, 256, base.region_gutter),
         )
 
 
