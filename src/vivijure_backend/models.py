@@ -128,10 +128,18 @@ class ModelServer:
         if "keyframe" in self._cache:
             return self._cache["keyframe"]
         import torch
-        from diffusers import StableDiffusionXLPipeline
+        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
 
         spec = self.specs[ModelRole.KEYFRAME_BASE]
-        pipe = StableDiffusionXLPipeline.from_pretrained(spec.repo_id, torch_dtype=torch.bfloat16)
+        cn_spec = self.specs[ModelRole.CONTROLNET_POSE]
+        # The keyframe pipe is a ControlNet pipeline so the regional multi-character path can plant
+        # two distinct bodies with an OpenPose skeleton (keyframe._render_regional); the single path
+        # hands it a blank control image at conditioning_scale 0.0, which makes the ControlNet inert
+        # (zero residual), so single-subject renders behave exactly like plain SDXL. Sharing one pipe
+        # keeps the dynamic per-scene LoRA + IP-Adapter attach points identical across both paths.
+        controlnet = ControlNetModel.from_pretrained(cn_spec.repo_id, torch_dtype=torch.bfloat16)
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            spec.repo_id, controlnet=controlnet, torch_dtype=torch.bfloat16)
         pipe.to("cuda")
         _set_attention(pipe, self.device)
         self._cache["keyframe"] = pipe

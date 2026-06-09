@@ -29,6 +29,7 @@ MULTI_CHAR_DEFAULTS: dict[str, object] = {
     "lora_scale_per_slot": 0.3,
     "ip_adapter_scale_per_slot": 0.7,
     "max_slots": 2,
+    "region_gutter": 64,
 }
 
 

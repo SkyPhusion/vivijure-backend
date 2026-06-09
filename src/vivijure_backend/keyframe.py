@@ -46,6 +46,8 @@ class KeyframeParams:
     lora_scale: float = DEFAULT_LORA_SCALE
     ip_adapter_scale: float = DEFAULT_IP_ADAPTER_SCALE
     pose_conditioning: bool = True   # ControlNet-OpenPose to separate bodies in multi-char shots
+    controlnet_pose_scale: float = 0.55  # OpenPose ControlNet conditioning scale (regional path)
+    region_gutter: int = 64          # px dead band between regional masks so they do not seam-blend
     negative_prompt: str = DEFAULT_NEGATIVE
     max_slots: int = 2               # regional path is tuned for 2; more is future work
 
@@ -87,25 +89,29 @@ def build_prompt(scene: Scene, cast: Cast, storyboard: Storyboard) -> str:
 
 # ------------------------------------------------------------------------- region geometry
 
-def region_boxes(width: int, height: int, n: int, *, orientation: str = "vertical") -> list[tuple[int, int, int, int]]:
-    """Split the canvas into `n` equal regions, one per character, as (left, top, right, bottom)
-    boxes. Vertical orientation (side-by-side strips) is the default for the common two-shot;
-    horizontal stacks them. Pure geometry, so the mask generation that consumes it is testable
-    without an image library."""
+def region_boxes(width: int, height: int, n: int, *, orientation: str = "vertical",
+                 gutter: int = 0) -> list[tuple[int, int, int, int]]:
+    """Split the canvas into `n` regions, one per character, as (left, top, right, bottom) boxes.
+    Vertical orientation (side-by-side strips) is the default for the common two-shot; horizontal
+    stacks them. `gutter` carves a dead band of that many pixels between adjacent regions (the
+    interior edges are inset by gutter//2; the outer canvas edges stay flush) so the IP-Adapter
+    masks do not abut and blend at the seam. Pure geometry, so the mask generation that consumes it
+    is testable without an image library."""
     if n <= 1:
         return [(0, 0, width, height)]
+    g = max(0, gutter) // 2
     boxes = []
     if orientation == "vertical":
         step = width // n
         for i in range(n):
-            left = i * step
-            right = width if i == n - 1 else (i + 1) * step  # last region absorbs the remainder
+            left = i * step + (g if i > 0 else 0)
+            right = (width if i == n - 1 else (i + 1) * step) - (g if i < n - 1 else 0)
             boxes.append((left, 0, right, height))
     else:
         step = height // n
         for i in range(n):
-            top = i * step
-            bottom = height if i == n - 1 else (i + 1) * step
+            top = i * step + (g if i > 0 else 0)
+            bottom = (height if i == n - 1 else (i + 1) * step) - (g if i < n - 1 else 0)
             boxes.append((0, top, width, bottom))
     return boxes
 
@@ -172,10 +178,15 @@ def _render_single(pipe, prompt, scene, cast, cfg, loras, generator):
         pipe.set_ip_adapter_scale(cfg.ip_adapter_scale)
     else:
         _ensure_ip_adapter(pipe, 0)  # clear any IP-Adapter a prior scene left on the shared pipe
+    # The shared keyframe pipe is a ControlNet pipeline; a single subject wants no pose control, so
+    # hand it a blank control image at conditioning_scale 0.0 -> the ControlNet is inert (zero
+    # residual) and this path renders exactly like plain SDXL.
     return pipe(
         prompt=prompt, negative_prompt=cfg.negative_prompt,
         num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
         height=cfg.resolution, width=cfg.resolution, generator=generator,
+        image=_blank_control(cfg.resolution, cfg.resolution),
+        controlnet_conditioning_scale=0.0,
         **({"ip_adapter_image": ip_images[0]} if ip_images else {}),
     ).images[0]
 
@@ -188,7 +199,7 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
 
     slots = scene.character_slots[:cfg.max_slots]
     res = cfg.resolution
-    boxes = region_boxes(res, res, len(slots), orientation="vertical")
+    boxes = region_boxes(res, res, len(slots), orientation="vertical", gutter=cfg.region_gutter)
 
     _bind_loras(pipe, {s: loras[s] for s in slots if s in loras}, cfg.lora_scale)
 
@@ -199,17 +210,30 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
     masks = IPAdapterMaskProcessor().preprocess(
         [_box_mask(res, res, b) for b in boxes], height=res, width=res)
 
-    call_kwargs = dict(
+    # Plant two distinct bodies: an OpenPose skeleton with one standing figure per region box, so
+    # the masked IP-Adapter identities land on SEPARATE people instead of merging into one (the
+    # "older Aria" collapse). An explicit pose_image overrides the generated skeleton. With
+    # pose_conditioning off, a blank control image at scale 0.0 makes the ControlNet inert and the
+    # path degrades to masked-IP-Adapter only.
+    if cfg.pose_conditioning:
+        if pose_image is not None:
+            from PIL import Image
+            control = Image.open(pose_image).convert("RGB").resize((res, res))
+        else:
+            control = _pose_skeleton(res, res, boxes)
+        cn_scale = cfg.controlnet_pose_scale
+    else:
+        control = _blank_control(res, res)
+        cn_scale = 0.0
+    return pipe(
         prompt=prompt, negative_prompt=cfg.negative_prompt,
         num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
         height=res, width=res, generator=generator,
         ip_adapter_image=ip_images,
         cross_attention_kwargs={"ip_adapter_masks": masks},
-    )
-    if cfg.pose_conditioning and pose_image is not None:
-        from PIL import Image
-        call_kwargs["image"] = Image.open(pose_image).convert("RGB")  # ControlNet-OpenPose hint
-    return pipe(**call_kwargs).images[0]
+        image=control,
+        controlnet_conditioning_scale=cn_scale,
+    ).images[0]
 
 
 # --------------------------------------------------------------------------- internals (GPU)
@@ -307,3 +331,49 @@ def _box_mask(width, height, box):
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rectangle(box, fill=255)
     return mask
+
+
+def _blank_control(width, height):
+    """Black control image. A ControlNet at conditioning_scale 0 ignores it, so the single /
+    no-pose paths keep the shared ControlNet pipe behaving like plain SDXL."""
+    from PIL import Image
+    return Image.new("RGB", (width, height), (0, 0, 0))
+
+
+# COCO-18 OpenPose layout (the format the xinsir SDXL OpenPose ControlNet follows). Keypoint order
+# 0..17: nose, neck, R-shoulder, R-elbow, R-wrist, L-shoulder, L-elbow, L-wrist, R-hip, R-knee,
+# R-ankle, L-hip, L-knee, L-ankle, R-eye, L-eye, R-ear, L-ear. `_POSE_KP` is one upright,
+# front-facing standing figure as (x, y) normalized within a region box.
+_POSE_KP = [
+    (0.50, 0.10), (0.50, 0.20), (0.40, 0.22), (0.34, 0.38), (0.32, 0.54),
+    (0.60, 0.22), (0.66, 0.38), (0.68, 0.54), (0.44, 0.54), (0.43, 0.74),
+    (0.43, 0.94), (0.56, 0.54), (0.57, 0.74), (0.57, 0.94), (0.47, 0.085),
+    (0.53, 0.085), (0.44, 0.095), (0.56, 0.095),
+]
+_POSE_LIMBS = [(1, 2), (1, 5), (2, 3), (3, 4), (5, 6), (6, 7), (1, 8), (8, 9), (9, 10),
+               (1, 11), (11, 12), (12, 13), (1, 0), (0, 14), (14, 16), (0, 15), (15, 17)]
+_POSE_COLORS = [(255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0), (170, 255, 0),
+                (85, 255, 0), (0, 255, 0), (0, 255, 85), (0, 255, 170), (0, 255, 255),
+                (0, 170, 255), (0, 85, 255), (0, 0, 255), (85, 0, 255), (170, 0, 255),
+                (255, 0, 255), (255, 0, 170), (255, 0, 85)]
+
+
+def _pose_skeleton(width, height, boxes):
+    """Render an OpenPose skeleton with ONE standing COCO-18 figure per region box on black, so the
+    ControlNet plants exactly that many distinct bodies (the fix for two characters merging into
+    one). Each figure scales into its box with a small vertical margin. Geometry is deterministic;
+    visual fidelity to the ControlNet's training distribution is validated on the pod."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (width, height), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for (l, t, r, b) in boxes:
+        bw, bh = r - l, b - t
+        my = int(bh * 0.04)  # top/bottom margin so head + ankles are not clipped at the box edge
+        pts = [(l + x * bw, t + my + y * (bh - 2 * my)) for (x, y) in _POSE_KP]
+        lw = max(2, bw // 70)
+        for i, (a, c) in enumerate(_POSE_LIMBS):
+            draw.line([pts[a], pts[c]], fill=_POSE_COLORS[i % len(_POSE_COLORS)], width=lw)
+        rad = max(2, bw // 90)
+        for i, (px, py) in enumerate(pts):
+            draw.ellipse([px - rad, py - rad, px + rad, py + rad], fill=_POSE_COLORS[i % len(_POSE_COLORS)])
+    return img

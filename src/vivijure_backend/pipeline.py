@@ -55,6 +55,8 @@ def keyframe_params_from(config: RenderConfig) -> KeyframeParams:
         lora_scale=mc.lora_scale_per_slot,
         ip_adapter_scale=mc.ip_adapter_scale_per_slot,
         pose_conditioning=mc.pose_conditioning,
+        controlnet_pose_scale=mc.controlnet_pose_scale,
+        region_gutter=mc.region_gutter,
         max_slots=mc.max_slots,
     )
 
