@@ -51,11 +51,12 @@ class KeyframeParams:
     lora_scale: float = DEFAULT_LORA_SCALE
     ip_adapter_scale: float = DEFAULT_IP_ADAPTER_SCALE
     # Identity method for the SINGLE-character path: "ip_adapter" (h94 IP-Adapter, the default) or
-    # "instantid" (insightface face-embed + the InstantID face-keypoints ControlNet, higher face
-    # fidelity). Multi-character shots ignore this and always take the masked-IP-Adapter regional path.
+    # "instantid" (insightface face-embed projected through InstantID's image-projection + IP attn,
+    # higher face fidelity). Multi-character shots ignore this and always take the masked-IP-Adapter
+    # regional path.
     identity_method: str = "ip_adapter"
-    instantid_controlnet_scale: float = 0.8  # InstantID face-keypoints ControlNet conditioning scale
     instantid_ip_adapter_scale: float = 0.8  # InstantID face-embedding (image-proj) scale
+    instantid_controlnet_scale: float = 0.8  # reserved for the future InstantID IdentityNet (unused)
     pose_conditioning: bool = True   # ControlNet-OpenPose to separate bodies in multi-char shots
     controlnet_pose_scale: float = 0.55  # OpenPose ControlNet conditioning scale (regional path)
     region_gutter: int = 64          # px dead band between regional masks so they do not seam-blend
@@ -259,14 +260,13 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
 
 
 def _render_instantid(server, prompt, scene, cast, cfg, loras, slot):
-    """Single-character InstantID keyframe: the slot's reference face drives both a face-embedding
-    injection (projected to identity tokens, fed through the IP cross-attention) and a face-keypoints
-    ControlNet that pins the face structure. The slot's character LoRA still binds for body/style.
+    """Single-character InstantID keyframe: the slot's reference face is embedded by insightface,
+    projected to identity tokens, and injected into the UNet cross-attention (InstantID's face IP-
+    Adapter) on a plain SDXL pipe. The slot's character LoRA still binds for body/style.
 
-    A stock SDXL ControlNet pipe does not know to append InstantID's identity tokens to the prompt
-    embeds, so we encode the prompt explicitly and concatenate the tokens (zeros on the uncond side);
-    every cross-attention is an IPAttnProcessor that splits the text tokens from the identity tokens.
-    GPU body, validated on a pod (the embed-concat + ControlNet conditioning are what to eyeball)."""
+    Identity tokens reach the UNet through the IP attn processors' side channel (`proc.id_embeds`), so
+    the prompt embeds stay clean. Uses the identity IP-Adapter only (no IdentityNet ControlNet -- see
+    models.instantid_pipeline). GPU body, validated on a pod."""
     import torch
     from . import instantid as _iid
 
@@ -276,33 +276,30 @@ def _render_instantid(server, prompt, scene, cast, cfg, loras, slot):
     _bind_loras(pipe, {slot: loras[slot]} if slot in loras else {}, cfg.lora_scale,
                 few_step=cfg.few_step)
 
-    # Identity from the reference face: embedding -> identity tokens, keypoints -> control image.
     ref = _ref_images(cast, slot, count=1)[0]
     analyzed = _iid.analyze_face(server.face_analyzer(), ref)
-    if analyzed is None:  # no face detected: fall back to the plain IP-Adapter single path
-        return _render_single(pipe, prompt, scene, cast, cfg, loras, generator)
-    embedding, kps, (rw, rh) = analyzed
-    res = cfg.resolution
-    sx, sy = res / max(1, rw), res / max(1, rh)
-    kps_image = _iid.draw_kps(res, res, [(x * sx, y * sy) for x, y in kps])
-    id_tokens = _iid.faceid_tokens(pipe._vj_image_proj, embedding)
+    if analyzed is None:  # no face detected: fall back to the shared keyframe pipe's IP-Adapter path
+        kpipe = server.keyframe_pipeline()
+        _apply_scheduler(kpipe, cfg)
+        return _render_single(kpipe, prompt, scene, cast, cfg, loras, generator)
+    embedding = analyzed[0]
+    id_tokens = _iid.faceid_tokens(pipe._vj_image_proj, embedding)  # (1, num_tokens, 2048)
 
-    # Retune the IP cross-attention strength for this render, then build prompt embeds with the
-    # identity tokens appended (uncond side gets zeros so CFG does not hallucinate an identity).
+    # Feed identity through the IP attn SIDE channel. CFG batch is [uncond; cond]: zero identity for
+    # the uncond pass so guidance does not invent a face, the real tokens for cond.
+    id_embeds = torch.cat([torch.zeros_like(id_tokens), id_tokens], dim=0)
     for proc in pipe._vj_id_attn.values():
         proc.scale = cfg.instantid_ip_adapter_scale
-    pe, npe, pooled, npooled = pipe.encode_prompt(
-        prompt=prompt, negative_prompt=cfg.negative_prompt, device="cuda",
-        num_images_per_prompt=1, do_classifier_free_guidance=True)
-    pe = torch.cat([pe, id_tokens.to(pe.dtype)], dim=1)
-    npe = torch.cat([npe, torch.zeros_like(id_tokens).to(npe.dtype)], dim=1)
-    return pipe(
-        prompt_embeds=pe, negative_prompt_embeds=npe,
-        pooled_prompt_embeds=pooled, negative_pooled_prompt_embeds=npooled,
-        num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
-        height=res, width=res, generator=generator,
-        image=kps_image, controlnet_conditioning_scale=cfg.instantid_controlnet_scale,
-    ).images[0]
+        proc.id_embeds = id_embeds
+    try:
+        return pipe(
+            prompt=prompt, negative_prompt=cfg.negative_prompt,
+            num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
+            height=cfg.resolution, width=cfg.resolution, generator=generator,
+        ).images[0]
+    finally:
+        for proc in pipe._vj_id_attn.values():
+            proc.id_embeds = None  # clear so a later render on the warm pipe never reuses them
 
 
 # --------------------------------------------------------------------------- internals (GPU)
@@ -339,6 +336,29 @@ def _apply_scheduler(pipe, cfg: KeyframeParams) -> None:
         pipe.scheduler = base  # tcd is handled by the unified-LoRA path (not wired here); restore base
 
 
+def _normalize_lora_state_dict(sd: dict) -> dict:
+    """Convert a raw-PEFT LoRA state dict to the diffusers SDXL convention.
+
+    Raw-PEFT format (save_file(get_peft_model_state_dict(unet)) without convert_state_dict_to_diffusers):
+    keys have a `base_model.model.` prefix (or none), no `unet.` scope, and use `lora_A`/`lora_B`
+    weight names. Diffusers format: `unet.<layer>.lora.down.weight` / `unet.<layer>.lora.up.weight`.
+
+    Returns sd unchanged when it is already in diffusers format (no `.lora_A.` keys present).
+    Pure key remapping -- no tensors allocated, CPU-safe.
+    """
+    if not any(".lora_A." in k or ".lora_B." in k for k in sd):
+        return sd
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("base_model.model."):
+            k = k[len("base_model.model."):]
+        k = f"unet.{k}"
+        k = k.replace(".lora_A.", ".lora.down.")
+        k = k.replace(".lora_B.", ".lora.up.")
+        out[k] = v
+    return out
+
+
 def _bind_loras(pipe, slot_paths: dict, scale: float, *, few_step: bool = True) -> list[str]:
     """Load each slot's character LoRA and activate it alongside whatever base adapter is already
     on the pipe (a few-step distill LoRA, if the ModelServer loaded one). Character LoRAs go on at
@@ -361,19 +381,25 @@ def _bind_loras(pipe, slot_paths: dict, scale: float, *, few_step: bool = True) 
         pipe.delete_adapters(stale)
     loaded = []
     for slot, path in slot_paths.items():
-        pipe.load_lora_weights(str(path), adapter_name=slot)
+        p = Path(path)
+        if p.is_file():
+            # On the GPU path the LoRA always exists on disk; load it so we can detect and convert
+            # raw-PEFT format (cast-builder writes via save_file(get_peft_model_state_dict()) without
+            # convert_state_dict_to_diffusers). CPU unit-test stubs use fictional paths that are
+            # never on disk, so they take the else branch and the fake pipe handles them as before.
+            from safetensors.torch import load_file as _sf_load
+            state_dict = _normalize_lora_state_dict(_sf_load(str(p)))
+            pipe.load_lora_weights(state_dict, adapter_name=slot)
+        else:
+            pipe.load_lora_weights(str(path), adapter_name=slot)
         # diffusers silently loads ZERO modules when the safetensors keys do not match the pipe's
-        # convention (e.g. a raw PEFT, unet-only state dict with no `unet.` prefix and lora_A/lora_B
-        # naming, as the standalone cast trainer writes). Left unchecked the slot never registers and
-        # set_adapters below explodes with an opaque "not in the list of present adapters: set()".
-        # Fail fast and loud: a staged LoRA that registers nothing would otherwise silently render
-        # the character without its identity adapter, the exact silent-wrong-identity outcome the
-        # harness staging already guards against.
+        # convention. Left unchecked the slot never registers and set_adapters below explodes with
+        # an opaque "not in the list of present adapters: set()". The normalization above should
+        # handle all known raw-PEFT variants; this guard catches anything genuinely unrecognized.
         if slot not in _adapter_names(pipe):
             raise ValueError(
                 f"LoRA for slot {slot!r} ({path}) registered no adapter: its safetensors keys did "
-                f"not match the diffusers convention (expected a 'unet.'-prefixed lora.down/up state "
-                f"dict; load_lora_weights ignored what it was given). Refusing to render the "
+                f"not match the diffusers convention after normalization. Refusing to render the "
                 f"character without its identity adapter.")
         loaded.append(slot)
     # The distill base adapter rides at 1.0 on the few-step path and 0.0 (inert) on the full-step

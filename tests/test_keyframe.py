@@ -8,6 +8,7 @@ from vivijure_backend.keyframe import (
     KeyframeParams,
     _bind_loras,
     _ensure_ip_adapter,
+    _normalize_lora_state_dict,
     _pose_skeleton,
     build_prompt,
     engine_for,
@@ -172,6 +173,56 @@ def test_bind_loras_fails_loud_when_a_lora_registers_no_adapter():
         _bind_loras(_NoRegisterPipe(), {"A": "a.safetensors"}, 0.3)
     # the base-only / no-character case must NOT raise (nothing to load, nothing to check)
     assert _bind_loras(_NoRegisterPipe(), {}, 0.3) == []
+
+
+# -------------------------------------------------------- _normalize_lora_state_dict (pure CPU)
+
+def test_normalize_lora_state_dict_passthrough_for_diffusers_format():
+    # Already-diffusers keys (unet. prefix, lora.down/up naming) must come back unchanged.
+    sd = {
+        "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight": 1,
+        "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight": 2,
+    }
+    assert _normalize_lora_state_dict(sd) is sd
+
+
+def test_normalize_lora_state_dict_converts_raw_peft_with_base_model_prefix():
+    # Raw PEFT from get_peft_model_state_dict(unet): base_model.model. prefix, lora_A/lora_B keys.
+    raw = {
+        "base_model.model.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight": 1,
+        "base_model.model.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_B.weight": 2,
+    }
+    out = _normalize_lora_state_dict(raw)
+    assert set(out.keys()) == {
+        "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight",
+        "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight",
+    }
+    assert list(out.values()) == [1, 2]
+
+
+def test_normalize_lora_state_dict_converts_raw_peft_without_base_model_prefix():
+    # Variant: no base_model.model. prefix but still lora_A/lora_B (legacy save path).
+    raw = {
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight": 10,
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_B.weight": 20,
+    }
+    out = _normalize_lora_state_dict(raw)
+    assert "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight" in out
+    assert "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight" in out
+    assert out["unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight"] == 10
+
+
+def test_normalize_lora_state_dict_preserves_non_lora_keys():
+    # Any keys that don't contain .lora_A. / .lora_B. are still remapped to unet. scope but otherwise
+    # left untouched (e.g. alpha scalars stored alongside the weights in some PEFT saves).
+    raw = {
+        "base_model.model.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight": 1,
+        "base_model.model.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_B.weight": 2,
+        "base_model.model.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_alpha": 16,
+    }
+    out = _normalize_lora_state_dict(raw)
+    assert "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_alpha" in out
+    assert out["unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_alpha"] == 16
 
 
 def test_bind_loras_keeps_base_distill_adapter_across_scenes():
