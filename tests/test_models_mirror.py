@@ -26,10 +26,12 @@ def test_cold_start_skips_heavy_i2v_and_dead_repos():
         assert f"hub/{repo}/**" in cmd          # each skip repo becomes an rclone --exclude
 
 
-def test_wan_i2v_is_both_cold_start_skipped_and_lazy():
-    # The i2v model is excluded from cold start AND pulled lazily -- never double-pulled, never missed.
-    wan = "models--Wan-AI--Wan2.2-I2V-A14B-Diffusers"
-    assert wan in DEFAULT_SKIP_REPOS and wan in I2V_LAZY_REPOS
+def test_every_lazy_repo_is_cold_start_skipped():
+    # Invariant: anything the lazy path owns must be excluded from the cold-start pull, so it is
+    # never double-pulled and never missed. (Both Wan I2V and the Lightning distill, now that
+    # Lightning is seeded in R2 and would otherwise be pulled eagerly.)
+    for repo in I2V_LAZY_REPOS:
+        assert repo in DEFAULT_SKIP_REPOS
 
 
 def test_ensure_i2v_skips_when_sentinel_present(tmp_path):
