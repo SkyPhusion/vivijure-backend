@@ -20,12 +20,27 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-# Repos kept in R2 as the canonical mirror but NOT pulled on cold start (lazy / not loaded by
-# the default i2v path). Tune per the live model set; this is the deploy's call, not the code's.
-DEFAULT_SKIP_REPOS = (
-    "models--Wan-AI--Wan2.2-T2V-A14B-Diffusers",
-    "spaces--InstantX--InstantID",
+# The heavy i2v repos (Wan I2V + the Lightning distill, ~120GB), pulled LAZILY by
+# ensure_i2v_models() on the first i2v_pipeline() use. A keyframe/preview worker -- the common cheap
+# op -- never calls it, so it never pulls them. These are folded into DEFAULT_SKIP_REPOS below so the
+# cold-start pull always excludes exactly what the lazy path owns (no double-pull, no miss).
+I2V_LAZY_REPOS = (
+    "models--Wan-AI--Wan2.2-I2V-A14B-Diffusers",
+    "models--lightx2v--Wan2.2-Lightning",
 )
+
+# Repos NOT pulled at cold start: the lazy i2v repos above, plus dead weight nothing in the model
+# spec loads (T2V is never used; the two stray SDXL repos are not in the spec). Storage in R2 is kept
+# (cheap, safer); these are pull-time excludes only. Tune per the live model set, the deploy's call.
+DEFAULT_SKIP_REPOS = I2V_LAZY_REPOS + (
+    "models--Wan-AI--Wan2.2-T2V-A14B-Diffusers",          # text-to-video: never loaded
+    "models--stabilityai--stable-diffusion-xl-base-1.0",  # not in the model spec (dead weight)
+    "models--stabilityai--sdxl-turbo",                    # not in the model spec (dead weight)
+    "spaces--InstantX--InstantID",                        # the HF Space, not the model repo
+)
+
+# Separate completion sentinel for the lazy i2v pull (the cold-start pull has its own, SENTINEL).
+I2V_SENTINEL = ".vj-i2v-mirror-complete"
 
 # HF's abandoned download temp files; model-presence checks treat any *.incomplete as a broken
 # repo, so never mirror them.
@@ -108,6 +123,42 @@ def ensure_models(*, env: dict | None = None, log: Callable[[str], None] = print
     models_root.mkdir(parents=True, exist_ok=True)
     sentinel.write_text("ok\n")
     log("models_mirror: model mirror from R2 complete.")
+    return True
+
+
+def ensure_i2v_models(*, env: dict | None = None, log: Callable[[str], None] = print,
+                      repos: tuple[str, ...] = I2V_LAZY_REPOS) -> bool:
+    """Lazily mirror the heavy i2v models (Wan I2V + the Lightning distill) from R2 on first i2v use.
+
+    Called from models.ModelServer.i2v_pipeline before the Wan weights load. A keyframe/preview
+    worker never calls it, so it skips ~120GB at cold start (those repos are in DEFAULT_SKIP_REPOS).
+    Idempotent via its own sentinel; returns True if a pull ran, False if skipped (warm, or no R2
+    creds so weights are assumed pre-provisioned). Raises on a hard failure, same as ensure_models.
+    """
+    e = env if env is not None else os.environ
+    hf_home = Path(e.get("HF_HOME", "/opt/models/hf-cache"))
+    models_root = Path(e.get("VJ_MODELS_ROOT", "/opt/models"))
+    bucket = e.get("R2_BUCKET", "vivijure")
+    sentinel = models_root / I2V_SENTINEL
+
+    if sentinel.exists():
+        log("models_mirror: i2v models already mirrored (sentinel present); skipping.")
+        return False
+    if not e.get("R2_ACCESS_KEY_ID"):
+        log("models_mirror: no R2 creds; i2v weights assumed pre-provisioned.")
+        return False
+    if shutil.which("rclone") is None:
+        raise RuntimeError("models_mirror: rclone is not installed in the image")
+
+    conf = rclone_conf(e, Path(tempfile.gettempdir()) / "vj-rclone")
+    hub = hf_home / "hub"
+    hub.mkdir(parents=True, exist_ok=True)
+    for repo in repos:
+        log(f"models_mirror: lazy i2v pull -> mirroring {repo} from R2...")
+        subprocess.run(mirror_cmd(conf, f"r2:{bucket}/models/hf-cache/hub/{repo}", hub / repo), check=True)
+    _reconstruct_symlinks(hf_home, log)
+    sentinel.write_text("ok\n")
+    log("models_mirror: i2v model mirror from R2 complete.")
     return True
 
 
