@@ -79,15 +79,17 @@ def largest_face(faces):
     return best
 
 
-def analyze_face(analyzer, image_path):
-    """Run insightface on a reference image and return (normed_embedding, kps, (width, height)) for
-    its largest face, or None if no face is found. The embedding feeds the image-projection; kps (in
-    the reference's pixel coords, hence the size, so the caller can scale them onto the output canvas)
-    feeds `draw_kps`. GPU/onnxruntime path: deferred imports, validated on a pod."""
+def analyze_face(analyzer, image):
+    """Run insightface on a reference and return (normed_embedding, kps, (width, height)) for its
+    largest face, or None if no face is found. `image` may be a PIL Image (what keyframe._ref_images
+    hands us) or a path/str. The embedding feeds the image-projection; kps (in the reference's pixel
+    coords, hence the size, so the caller can scale them onto the output canvas) feed `draw_kps`.
+    GPU/onnxruntime path: deferred imports, validated on a pod."""
     import numpy as np
     from PIL import Image
 
-    img = Image.open(image_path).convert("RGB")
+    img = image if isinstance(image, Image.Image) else Image.open(image)
+    img = img.convert("RGB")
     arr = np.array(img)[:, :, ::-1]  # insightface wants BGR
     face = largest_face(analyzer.get(arr))
     if face is None:
@@ -159,7 +161,10 @@ def build_image_proj(state_dict):
             return self.norm_out(self.proj_out(latents))
 
     model = Resampler()
-    model.load_state_dict(state_dict, strict=False)
+    r = model.load_state_dict(state_dict, strict=False)
+    if r.missing_keys or r.unexpected_keys:  # surfaces a future checkpoint-shape drift, not silence
+        print(f"[instantid] image_proj load mismatch: missing={len(r.missing_keys)} "
+              f"unexpected={len(r.unexpected_keys)} (identity may be degraded)", flush=True)
     return model
 
 
@@ -190,37 +195,48 @@ def set_instantid_ip_attn(unet, ip_state_dict, *, num_tokens: int = NUM_ID_TOKEN
     import torch.nn.functional as F
 
     class IPAttnProcessor(nn.Module):
+        """Cross-attention with an added IP-Adapter branch. The text cross-attention is computed
+        normally over `encoder_hidden_states` (the 77 prompt tokens, kept clean so the ControlNet is
+        unaffected); the identity tokens arrive via the SIDE channel `self.id_embeds` (set per render),
+        get their own attention, and are summed in at `self.scale`. NOT concatenated onto the prompt
+        embeds (that would corrupt the ControlNet, which never saw appended tokens)."""
         def __init__(self, hidden_size, cross_attention_dim, num_tokens, scale):
             super().__init__()
             self.num_tokens = num_tokens
             self.scale = scale
+            self.id_embeds = None  # (batch, num_tokens, cross_attention_dim); set just before pipe()
             self.to_k_ip = nn.Linear(cross_attention_dim, hidden_size, bias=False)
             self.to_v_ip = nn.Linear(cross_attention_dim, hidden_size, bias=False)
 
         def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kw):
-            residual = hidden_states
             if encoder_hidden_states is None:
-                encoder_hidden_states = hidden_states
-            # Split the prompt tokens from the appended identity tokens.
-            end = encoder_hidden_states.shape[1] - self.num_tokens
-            txt, ip = encoder_hidden_states[:, :end, :], encoder_hidden_states[:, end:, :]
+                encoder_hidden_states = hidden_states  # self-attn fallback (not hit on attn2)
             q = attn.to_q(hidden_states)
-            k, v = attn.to_k(txt), attn.to_v(txt)
+            k, v = attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states)
             heads, dim = attn.heads, q.shape[-1] // attn.heads
 
             def shape(t):
                 return t.view(t.shape[0], t.shape[1], heads, dim).transpose(1, 2)
 
             out = F.scaled_dot_product_attention(shape(q), shape(k), shape(v))
-            ip_out = F.scaled_dot_product_attention(shape(q), shape(self.to_k_ip(ip)), shape(self.to_v_ip(ip)))
-            out = out + self.scale * ip_out
+            if self.id_embeds is not None and self.scale:
+                ie = self.id_embeds.to(q.dtype)
+                if ie.shape[0] != q.shape[0]:  # match the (CFG or not) batch
+                    ie = ie[-q.shape[0]:] if ie.shape[0] > q.shape[0] else ie.repeat(q.shape[0], 1, 1)
+                ip_out = F.scaled_dot_product_attention(
+                    shape(q), shape(self.to_k_ip(ie)), shape(self.to_v_ip(ie)))
+                out = out + self.scale * ip_out
             out = out.transpose(1, 2).reshape(out.shape[0], -1, heads * dim)
-            out = attn.to_out[1](attn.to_out[0](out))
-            return out + residual if attn.residual_connection else out
+            return attn.to_out[1](attn.to_out[0](out))
 
+    # InstantID's ip_adapter weights are keyed by each layer's index over ALL attn processors (self +
+    # cross) in unet.attn_processors order; self-attn slots carry no params, so the checkpoint simply
+    # has no keys for them. Enumerate the full processor list and load each cross-attention layer's
+    # to_k_ip / to_v_ip from the checkpoint by its OVERALL index (a ModuleList over the full set is
+    # not possible: diffusers' default self-attn processor is not an nn.Module).
     procs = {}
     installed = {}
-    for name in unet.attn_processors.keys():
+    for idx, name in enumerate(unet.attn_processors.keys()):
         if not name.endswith("attn2.processor"):  # cross-attention only
             procs[name] = unet.attn_processors[name]
             continue
@@ -234,10 +250,13 @@ def set_instantid_ip_attn(unet, ip_state_dict, *, num_tokens: int = NUM_ID_TOKEN
             hidden = unet.config.block_out_channels[i]
         p = IPAttnProcessor(hidden, CROSS_ATTENTION_DIM, num_tokens, scale).to(
             device=unet.device, dtype=unet.dtype)
+        kw = ip_state_dict.get(f"{idx}.to_k_ip.weight")
+        vw = ip_state_dict.get(f"{idx}.to_v_ip.weight")
+        if kw is not None:
+            p.to_k_ip.weight.data.copy_(kw.to(device=unet.device, dtype=unet.dtype))
+        if vw is not None:
+            p.to_v_ip.weight.data.copy_(vw.to(device=unet.device, dtype=unet.dtype))
         procs[name] = p
         installed[name] = p
     unet.set_attn_processor(procs)
-    # Load the trained ip projections (keys are ordered to match the cross-attention layers).
-    weights = nn.ModuleList(installed.values())
-    weights.load_state_dict(ip_state_dict, strict=False)
     return installed
