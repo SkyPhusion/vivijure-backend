@@ -336,6 +336,29 @@ def _apply_scheduler(pipe, cfg: KeyframeParams) -> None:
         pipe.scheduler = base  # tcd is handled by the unified-LoRA path (not wired here); restore base
 
 
+def _normalize_lora_state_dict(sd: dict) -> dict:
+    """Convert a raw-PEFT LoRA state dict to the diffusers SDXL convention.
+
+    Raw-PEFT format (save_file(get_peft_model_state_dict(unet)) without convert_state_dict_to_diffusers):
+    keys have a `base_model.model.` prefix (or none), no `unet.` scope, and use `lora_A`/`lora_B`
+    weight names. Diffusers format: `unet.<layer>.lora.down.weight` / `unet.<layer>.lora.up.weight`.
+
+    Returns sd unchanged when it is already in diffusers format (no `.lora_A.` keys present).
+    Pure key remapping -- no tensors allocated, CPU-safe.
+    """
+    if not any(".lora_A." in k or ".lora_B." in k for k in sd):
+        return sd
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("base_model.model."):
+            k = k[len("base_model.model."):]
+        k = f"unet.{k}"
+        k = k.replace(".lora_A.", ".lora.down.")
+        k = k.replace(".lora_B.", ".lora.up.")
+        out[k] = v
+    return out
+
+
 def _bind_loras(pipe, slot_paths: dict, scale: float, *, few_step: bool = True) -> list[str]:
     """Load each slot's character LoRA and activate it alongside whatever base adapter is already
     on the pipe (a few-step distill LoRA, if the ModelServer loaded one). Character LoRAs go on at
@@ -358,19 +381,25 @@ def _bind_loras(pipe, slot_paths: dict, scale: float, *, few_step: bool = True) 
         pipe.delete_adapters(stale)
     loaded = []
     for slot, path in slot_paths.items():
-        pipe.load_lora_weights(str(path), adapter_name=slot)
+        p = Path(path)
+        if p.is_file():
+            # On the GPU path the LoRA always exists on disk; load it so we can detect and convert
+            # raw-PEFT format (cast-builder writes via save_file(get_peft_model_state_dict()) without
+            # convert_state_dict_to_diffusers). CPU unit-test stubs use fictional paths that are
+            # never on disk, so they take the else branch and the fake pipe handles them as before.
+            from safetensors.torch import load_file as _sf_load
+            state_dict = _normalize_lora_state_dict(_sf_load(str(p)))
+            pipe.load_lora_weights(state_dict, adapter_name=slot)
+        else:
+            pipe.load_lora_weights(str(path), adapter_name=slot)
         # diffusers silently loads ZERO modules when the safetensors keys do not match the pipe's
-        # convention (e.g. a raw PEFT, unet-only state dict with no `unet.` prefix and lora_A/lora_B
-        # naming, as the standalone cast trainer writes). Left unchecked the slot never registers and
-        # set_adapters below explodes with an opaque "not in the list of present adapters: set()".
-        # Fail fast and loud: a staged LoRA that registers nothing would otherwise silently render
-        # the character without its identity adapter, the exact silent-wrong-identity outcome the
-        # harness staging already guards against.
+        # convention. Left unchecked the slot never registers and set_adapters below explodes with
+        # an opaque "not in the list of present adapters: set()". The normalization above should
+        # handle all known raw-PEFT variants; this guard catches anything genuinely unrecognized.
         if slot not in _adapter_names(pipe):
             raise ValueError(
                 f"LoRA for slot {slot!r} ({path}) registered no adapter: its safetensors keys did "
-                f"not match the diffusers convention (expected a 'unet.'-prefixed lora.down/up state "
-                f"dict; load_lora_weights ignored what it was given). Refusing to render the "
+                f"not match the diffusers convention after normalization. Refusing to render the "
                 f"character without its identity adapter.")
         loaded.append(slot)
     # The distill base adapter rides at 1.0 on the few-step path and 0.0 (inert) on the full-step
