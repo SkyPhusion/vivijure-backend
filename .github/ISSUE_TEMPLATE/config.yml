@@ -1,0 +1,19 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/SkyPhusion/vivijure-backend/security
+    about: >
+      Please report vulnerabilities privately via the Security tab (Report a
+      vulnerability), not a public issue. See SECURITY.md for the trust model
+      and scope.
+  - name: Vivijure control plane (skyphusion-llm-public)
+    url: https://github.com/SkyPhusion/skyphusion-llm-public
+    about: >
+      This repo is the GPU render backend. The storyboard planner, cast prep,
+      auth, and the render API that drives this backend live in the control
+      plane repo.
+  - name: Clean-room provenance (read before filing code ideas)
+    url: https://github.com/SkyPhusion/vivijure-backend/blob/main/CONTRIBUTING.md
+    about: >
+      This is an independent reimplementation. Describe behavior or public
+      model/API docs, never another render pipeline's source.

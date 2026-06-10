@@ -1,0 +1,74 @@
+name: Bug report
+description: A render misbehaves (keyframes, LoRA, image-to-video, assembly, or the harness)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for the report. This repo is the render backend: it consumes a
+        project bundle (storyboard + cast) and produces keyframes, LoRAs, and
+        motion clips on a serverless GPU. The control plane that submits jobs is
+        a separate repo (skyphusion-llm-public). Please do not paste secrets
+        (R2 tokens, RunPod keys) or any third-party render-pipeline code.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        How to trigger it. A minimal bundle or render-job input is gold (redact
+        anything private). Note the action (render / preview / animate) if relevant.
+      placeholder: |
+        1. Submit a job with bundle ...
+        2. ...
+        3. See the error / wrong output
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where
+      options:
+        - Bundle read / contract parsing
+        - LoRA training (lora_train)
+        - SDXL keyframe (keyframe, single character)
+        - SDXL keyframe (multi-character, pose / regional)
+        - Image-to-video (i2v / Wan)
+        - Assembly / off-GPU finish (assemble)
+        - Orchestrator / render-job entrypoint
+        - Harness (RunPod handler, R2 I/O, model mirror, progress)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release tag or commit SHA.
+      placeholder: "backend-v0.1.15"
+    validations:
+      required: false
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - RunPod serverless (hosted GPU)
+        - My own self-hosted GPU
+        - Local CPU (tests / no GPU)
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Logs / progress snapshot / context
+      description: Handler logs, the structured progress snapshot, model ids. Redact tokens.
+      render: shell
+    validations:
+      required: false

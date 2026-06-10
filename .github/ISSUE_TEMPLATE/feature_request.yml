@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest a capability or improvement for the render backend
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        For the render backend (keyframes, LoRA training, image-to-video,
+        assembly, the harness). Planner / cast / API ideas belong to the control
+        plane repo (skyphusion-llm-public). This is a clean-room reimplementation:
+        describe the behavior you want or cite public model/API docs, never
+        another render pipeline's source.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to render or achieve that is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you would like to see. Rough is fine. Link public model/technique docs if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried or other approaches you weighed.
+    validations:
+      required: false
