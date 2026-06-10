@@ -31,6 +31,10 @@ DEFAULT_IP_ADAPTER_SCALE = 0.7
 DEFAULT_NEGATIVE = (
     "lowres, bad anatomy, extra limbs, fused faces, two heads, deformed, blurry, watermark, text"
 )
+# The persistent base adapter name the ModelServer loads the Hyper-SD few-step distill LoRA under
+# (models.ModelServer.keyframe_pipeline). _bind_loras keeps it active at 1.0 on the few-step path and
+# 0.0 on the full-step (final) path, so one warm pipe renders every tier.
+DISTILL_ADAPTER = "distill"
 
 
 @dataclass
@@ -43,6 +47,7 @@ class KeyframeParams:
     resolution: int = 1024
     seed: int = 0
     few_step: bool = True            # use the Hyper-SD/DMD2 distilled path the ModelServer loaded
+    scheduler: str = "ddim_trailing" # config.Scheduler value; few-step wants ddim_trailing, final a solver
     lora_scale: float = DEFAULT_LORA_SCALE
     ip_adapter_scale: float = DEFAULT_IP_ADAPTER_SCALE
     pose_conditioning: bool = True   # ControlNet-OpenPose to separate bodies in multi-char shots
@@ -153,6 +158,7 @@ def render_keyframe(
     import torch  # deferred: keep this module CPU-importable
 
     pipe = server.keyframe_pipeline()
+    _apply_scheduler(pipe, cfg)
     generator = torch.Generator(device="cuda").manual_seed(cfg.seed)
     loras = {s: Path(p) for s, p in (lora_paths or {}).items()}
 
@@ -170,7 +176,8 @@ def _render_single(pipe, prompt, scene, cast, cfg, loras, generator):
     """One character (or none): the slot's LoRA bound, identity from a single IP-Adapter image.
     The plain SDXL identity path."""
     slot = scene.character_slots[0] if scene.character_slots else None
-    _bind_loras(pipe, {slot: loras[slot]} if (slot and slot in loras) else {}, cfg.lora_scale)
+    _bind_loras(pipe, {slot: loras[slot]} if (slot and slot in loras) else {}, cfg.lora_scale,
+                few_step=cfg.few_step)
 
     ip_images = _ref_images(cast, slot, count=1) if slot else None
     if ip_images:
@@ -201,7 +208,8 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
     res = cfg.resolution
     boxes = region_boxes(res, res, len(slots), orientation="vertical", gutter=cfg.region_gutter)
 
-    _bind_loras(pipe, {s: loras[s] for s in slots if s in loras}, cfg.lora_scale)
+    _bind_loras(pipe, {s: loras[s] for s in slots if s in loras}, cfg.lora_scale,
+                few_step=cfg.few_step)
 
     # One IP-Adapter image per slot (its refs), each confined to its region's mask.
     _ensure_ip_adapter(pipe, n=len(slots))
@@ -238,12 +246,46 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
 
 # --------------------------------------------------------------------------- internals (GPU)
 
-def _bind_loras(pipe, slot_paths: dict, scale: float) -> list[str]:
+def _apply_scheduler(pipe, cfg: KeyframeParams) -> None:
+    """Pin the SDXL sampler for this render on the warm shared pipe. The Hyper-SD few-step LoRA
+    needs DDIM with timestep_spacing="trailing" (cfg=0); the full-step final tier wants a higher-
+    order solver. Every scheduler is rebuilt from the pristine full-step config stashed by the
+    ModelServer (`_vj_default_scheduler`), so repeated draft->final->draft swaps on the warm pipe
+    never compound. Unrecognized values fall back to that pristine scheduler. GPU path: diffusers is
+    imported lazily so this module stays CPU-importable; the mapping is validated on a pod."""
+    from diffusers import (
+        DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler,
+        EulerAncestralDiscreteScheduler, UniPCMultistepScheduler,
+    )
+    base = getattr(pipe, "_vj_default_scheduler", None) or pipe.scheduler
+    base_cfg = base.config
+    sched = getattr(cfg, "scheduler", "ddim_trailing")
+    if sched == "ddim_trailing":
+        pipe.scheduler = DDIMScheduler.from_config(base_cfg, timestep_spacing="trailing")
+    elif sched == "ddim":
+        pipe.scheduler = DDIMScheduler.from_config(base_cfg)
+    elif sched == "dpmpp_2m_karras":
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(base_cfg, use_karras_sigmas=True)
+    elif sched == "dpmpp_2m":
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(base_cfg)
+    elif sched == "euler":
+        pipe.scheduler = EulerDiscreteScheduler.from_config(base_cfg)
+    elif sched == "euler_ancestral":
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(base_cfg)
+    elif sched == "unipc":
+        pipe.scheduler = UniPCMultistepScheduler.from_config(base_cfg)
+    else:
+        pipe.scheduler = base  # tcd is handled by the unified-LoRA path (not wired here); restore base
+
+
+def _bind_loras(pipe, slot_paths: dict, scale: float, *, few_step: bool = True) -> list[str]:
     """Load each slot's character LoRA and activate it alongside whatever base adapter is already
     on the pipe (a few-step distill LoRA, if the ModelServer loaded one). Character LoRAs go on at
-    the moderate per-slot `scale` (the anti-bleed weight); any pre-existing base adapter stays at
-    1.0. Discovering the base adapter instead of hardcoding a name means this is correct whether or
-    not a distill LoRA is present, and a missing one never silently drops the character identity.
+    the moderate per-slot `scale` (the anti-bleed weight); base adapters stay at 1.0, EXCEPT the
+    distill adapter, whose weight is gated by `few_step`: 1.0 on the draft/standard few-step path,
+    0.0 on the full-step (final) path, so the one warm pipe renders every tier without reloading.
+    Discovering the base adapter instead of hardcoding a name means this is correct whether or not a
+    distill LoRA is present, and a missing one never silently drops the character identity.
 
     The keyframe pipeline is a process-global shared across every scene on a warm worker, so the
     previous scene's character adapters are still attached on entry. Record the true base adapters
@@ -273,9 +315,14 @@ def _bind_loras(pipe, slot_paths: dict, scale: float) -> list[str]:
                 f"dict; load_lora_weights ignored what it was given). Refusing to render the "
                 f"character without its identity adapter.")
         loaded.append(slot)
-    if loaded:
-        names = base + loaded
-        pipe.set_adapters(names, adapter_weights=[1.0] * len(base) + [scale] * len(loaded))
+    # The distill base adapter rides at 1.0 on the few-step path and 0.0 (inert) on the full-step
+    # path; any other base adapter always stays at 1.0. Set the active set whenever ANYTHING is on
+    # the pipe (base and/or characters), so the distill weight tracks the tier even on a scene with
+    # no character. A pipe with no base and no character (the bare no-identity scene) sets nothing.
+    base_weights = [(1.0 if few_step else 0.0) if n == DISTILL_ADAPTER else 1.0 for n in base]
+    names = base + loaded
+    if names:
+        pipe.set_adapters(names, adapter_weights=base_weights + [scale] * len(loaded))
     return loaded
 
 

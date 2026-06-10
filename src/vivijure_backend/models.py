@@ -56,6 +56,7 @@ class ModelSpec:
     family: ModelFamily
     subfolder: str | None = None
     note: str = ""
+    weight_name: str | None = None   # specific file within repo_id (e.g. a per-step LoRA variant)
 
 
 # Default model set. These are public Hugging Face repo ids; swap per project via overrides.
@@ -66,7 +67,10 @@ DEFAULT_SPECS: dict[ModelRole, ModelSpec] = {
     ),
     ModelRole.KEYFRAME_FEWSTEP: ModelSpec(
         ModelRole.KEYFRAME_FEWSTEP, "ByteDance/Hyper-SD", ModelFamily.AUX,
-        note="few-step distill LoRA (Hyper-SDXL); DMD2 is the alt. Keyframes get animated, so 4-8 steps is plenty",
+        weight_name="Hyper-SDXL-8steps-lora.safetensors",
+        note="few-step distill LoRA (Hyper-SDXL); the 8-step variant is forgiving and still renders "
+             "well at 4-6 steps, so one warm adapter serves both draft (4) and standard (8). DMD2 is "
+             "the alt. Keyframes get animated, so 4-8 steps is plenty",
     ),
     ModelRole.I2V: ModelSpec(
         ModelRole.I2V, "Wan-AI/Wan2.2-I2V-A14B-Diffusers", ModelFamily.VIDEO_DIT,
@@ -142,6 +146,25 @@ class ModelServer:
             spec.repo_id, controlnet=controlnet, torch_dtype=torch.bfloat16)
         pipe.to("cuda")
         _set_attention(pipe, self.device)
+
+        # Stash the pristine (full-step) scheduler so keyframe._apply_scheduler can restore it for the
+        # final tier after a draft/standard render swapped in DDIM-trailing on this warm shared pipe.
+        pipe._vj_default_scheduler = pipe.scheduler
+        # Load the Hyper-SD few-step distill LoRA as a persistent BASE adapter (named "distill", NOT
+        # fused -- unlike i2v, the keyframe pipe stays bf16 so dynamic per-scene character LoRAs can
+        # still attach). keyframe._bind_loras keeps it active at weight 1.0 on draft/standard and 0.0
+        # on final, so one warm pipe serves every tier. A load failure degrades to full-step keyframes
+        # rather than crashing the worker.
+        few = self.specs.get(ModelRole.KEYFRAME_FEWSTEP)
+        pipe._vj_distill = None
+        if few is not None:
+            try:
+                pipe.load_lora_weights(few.repo_id, weight_name=few.weight_name, adapter_name="distill")
+                pipe._vj_distill = "distill"
+            except Exception as e:  # noqa: BLE001 -- never let a finicky distill load down the worker
+                print(f"keyframe distill LoRA load failed ({few.repo_id} / {few.weight_name}): {e}; "
+                      "full-step keyframes only.")
+
         self._cache["keyframe"] = pipe
         return pipe
 

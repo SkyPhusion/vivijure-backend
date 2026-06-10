@@ -22,11 +22,13 @@ from vivijure_backend.routing import QualityTier
 def test_keyframe_params_final_is_full_step():
     p = keyframe_params_from(RenderConfig.for_tier(QualityTier.FINAL))
     assert p.few_step is False and p.steps == 30
+    assert p.scheduler == "dpmpp_2m_karras"      # full-step solver, distill adapter off
 
 
 def test_keyframe_params_draft_is_few_step():
     p = keyframe_params_from(RenderConfig.for_tier(QualityTier.DRAFT))
     assert p.few_step is True and p.steps == 4   # distill_steps, not the full-path steps
+    assert p.scheduler == "ddim_trailing"        # Hyper-SD few-step path pins DDIM trailing
 
 
 def test_keyframe_params_pull_multichar_scales():

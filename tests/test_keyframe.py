@@ -182,6 +182,24 @@ def test_bind_loras_keeps_base_distill_adapter_across_scenes():
     assert pipe.active == [("distill", 1.0), ("B", 0.3)]
 
 
+def test_bind_loras_zeroes_distill_on_the_full_step_path():
+    # Final tier (few_step=False) must render WITHOUT the distill LoRA: it stays loaded on the warm
+    # pipe but at weight 0.0 (inert), so the same pipe serves draft and final without a reload.
+    pipe = _FakePipe(preloaded=["distill"])
+    _bind_loras(pipe, {"A": "a.safetensors"}, 0.3, few_step=False)
+    assert pipe.active == [("distill", 0.0), ("A", 0.3)]
+
+
+def test_bind_loras_tracks_distill_weight_for_a_no_character_scene():
+    # The distill weight must follow the tier even when a scene has no character to bind, so a
+    # no-character draft still rides the few-step LoRA and a no-character final does not.
+    pipe = _FakePipe(preloaded=["distill"])
+    _bind_loras(pipe, {}, 0.3, few_step=True)
+    assert pipe.active == [("distill", 1.0)]
+    _bind_loras(pipe, {}, 0.3, few_step=False)
+    assert pipe.active == [("distill", 0.0)]
+
+
 def test_bind_loras_clears_identity_for_a_no_character_scene():
     pipe = _FakePipe()
     _bind_loras(pipe, {"A": "a.safetensors"}, 0.3)
