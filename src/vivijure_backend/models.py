@@ -234,6 +234,11 @@ class ModelServer:
         here we load the warm baseline."""
         if "i2v" in self._cache:
             return self._cache["i2v"]
+        # Lazy mirror: the heavy Wan i2v weights (~120GB) are kept out of the cold-start pull and
+        # fetched from R2 here, on first i2v use, so keyframe/preview workers never pay for them.
+        # No-op when already present or when there are no R2 creds (weights pre-provisioned / HF).
+        from .harness.models_mirror import ensure_i2v_models
+        ensure_i2v_models()
         import os
         import torch
         from diffusers import WanImageToVideoPipeline

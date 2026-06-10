@@ -1,6 +1,46 @@
 """The .rclonelink -> symlink reconstruction, tested on CPU (no R2, no rclone). rclone --links
 leaves `<name>.rclonelink` marker files on download; the HF cache needs real symlinks."""
-from vivijure_backend.harness.models_mirror import _reconstruct_symlinks
+from pathlib import Path
+
+from vivijure_backend.harness.models_mirror import (
+    DEFAULT_SKIP_REPOS,
+    I2V_LAZY_REPOS,
+    I2V_SENTINEL,
+    _reconstruct_symlinks,
+    ensure_i2v_models,
+    mirror_cmd,
+)
+
+
+# ------------------------------------------------------ lazy i2v split (cold-start weight trim)
+
+def test_cold_start_skips_heavy_i2v_and_dead_repos():
+    # The cold-start pull must exclude the lazy i2v model and the two stray SDXL repos so a
+    # keyframe/preview worker does not pull ~120GB + ~90GB of dead weight it never loads.
+    for repo in ("models--Wan-AI--Wan2.2-I2V-A14B-Diffusers",
+                 "models--stabilityai--stable-diffusion-xl-base-1.0",
+                 "models--stabilityai--sdxl-turbo"):
+        assert repo in DEFAULT_SKIP_REPOS
+    cmd = mirror_cmd(Path("/x/conf"), "r2:b/models/hf-cache", Path("/dst"), skip_repos=DEFAULT_SKIP_REPOS)
+    for repo in DEFAULT_SKIP_REPOS:
+        assert f"hub/{repo}/**" in cmd          # each skip repo becomes an rclone --exclude
+
+
+def test_wan_i2v_is_both_cold_start_skipped_and_lazy():
+    # The i2v model is excluded from cold start AND pulled lazily -- never double-pulled, never missed.
+    wan = "models--Wan-AI--Wan2.2-I2V-A14B-Diffusers"
+    assert wan in DEFAULT_SKIP_REPOS and wan in I2V_LAZY_REPOS
+
+
+def test_ensure_i2v_skips_when_sentinel_present(tmp_path):
+    (tmp_path / I2V_SENTINEL).write_text("ok\n")
+    env = {"VJ_MODELS_ROOT": str(tmp_path), "R2_ACCESS_KEY_ID": "x"}
+    assert ensure_i2v_models(env=env, log=lambda *_: None) is False  # warm: no pull
+
+
+def test_ensure_i2v_skips_when_no_r2_creds(tmp_path):
+    env = {"VJ_MODELS_ROOT": str(tmp_path)}  # no R2 creds -> weights assumed pre-provisioned
+    assert ensure_i2v_models(env=env, log=lambda *_: None) is False
 
 
 def test_reconstructs_symlink_from_marker(tmp_path):

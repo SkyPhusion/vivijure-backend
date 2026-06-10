@@ -7,6 +7,26 @@ releases are summarized below from that history.
 
 ## Unreleased
 
+**perf(mirror): lazy-load the heavy i2v weights to cut cold-start startup ~5x.** The cold-start
+model mirror pulled the entire `r2:<bucket>/models/hf-cache` (~257 GiB after the prior skips) on
+every worker, but a keyframe/preview worker (the common cheap op) loads none of the i2v stack. Now:
+
+- `Wan2.2-I2V-A14B` (117.5 GiB) is in `DEFAULT_SKIP_REPOS` (out of the cold-start pull) and mirrored
+  LAZILY by the new `ensure_i2v_models()` on the first `i2v_pipeline()` call (its own sentinel,
+  idempotent). Keyframe/preview workers never pay for it.
+- Two stray repos that nothing in the spec loads -- `stable-diffusion-xl-base-1.0` (57.6 GiB) and
+  `sdxl-turbo` (32 GiB) -- are added to the cold-start skip (dead weight, ~90 GiB).
+- Net: a keyframe/preview cold start drops from ~257 GiB to ~50 GiB (the SDXL stack); the first
+  animation job pays the Wan pull once. R2 storage is unchanged (these are pull-time excludes only).
+
+Also seeds the two needed-but-missing models into the R2 mirror so the worker no longer depends on a
+live HF fetch: `Hyper-SDXL-8steps-lora.safetensors` (keyframe distill, cold-start) and
+`lightx2v/Wan2.2-Lightning` (i2v distill, lazy).
+
+Code: `harness/models_mirror.py` (expanded `DEFAULT_SKIP_REPOS`, `I2V_LAZY_REPOS`,
+`ensure_i2v_models`), `models.py` (`i2v_pipeline` calls the lazy pull),
+`tests/test_models_mirror.py` (cold-start skip + lazy early-returns). Full suite green.
+
 **InstantID single-character face identity (the consistent-identity lever).** Wires the
 scaffolded-but-dead InstantID path into the GPU keyframe stage: for a single-character shot with
 `identity_method="instantid"` and a reference face, the keyframe now uses insightface (antelopev2)
