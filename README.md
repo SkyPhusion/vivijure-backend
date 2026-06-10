@@ -16,12 +16,12 @@ plane's own.
 ## The contract (what the backend has to satisfy)
 
 Input: a bundle (`.tar.gz`) the control plane writes to object storage, containing
-- `storyboard.yaml` — the validated storyboard (see `contract.py:Storyboard`): a title,
+- `storyboard.yaml` -- the validated storyboard (see `contract.py:Storyboard`): a title,
   style fields, `use_characters`, and a list of scenes, each with a `prompt`, optional
   `character_slots`, beat timing (`start` / `end` / `target_seconds`), and an optional
   `start_image`.
-- `characters/registry.json` — slot to `{name, prompt, image}`.
-- `characters/refs/<SLOT>/ref_NN.<ext>` — per-character training / IP-Adapter references.
+- `characters/registry.json` -- slot to `{name, prompt, image}`.
+- `characters/refs/<SLOT>/ref_NN.<ext>` -- per-character training / IP-Adapter references.
 
 Output: the render-job result (see `contract.py:RenderResult`): the final `output_key`,
 the per-shot `keyframes` and `clips`, the trained-LoRA ids, and a `state` key, all in the
@@ -31,16 +31,18 @@ keys/shape the control plane polls for.
 
 | Module | Role | Status |
 |---|---|---|
-| `contract.py` | storyboard.yaml + cast + job I/O types; bundle reader | scaffolding |
-| `models.py` | load SDXL, InstantID, IP-Adapter, OpenPose ControlNet, Wan i2v | todo |
-| `lora_train.py` | SDXL character LoRA from refs | todo |
-| `keyframe.py` | per-scene SDXL keyframe; regional + pose for 2+ char shots | todo |
-| `i2v.py` | Wan image-to-video, keyframe to clip | todo |
-| `assemble.py` | concat / off-GPU finish | todo |
-| `orchestrator.py` | train, render, export; the render-job entrypoint | todo |
+| `contract.py` | storyboard.yaml + cast + job I/O types; bundle reader | done |
+| `models.py` | load SDXL, InstantID, IP-Adapter, OpenPose ControlNet, Wan i2v | done |
+| `lora_train.py` | SDXL character LoRA from refs | done |
+| `keyframe.py` | per-scene SDXL keyframe; regional + pose for 2+ char shots | done |
+| `i2v.py` | Wan image-to-video, keyframe to clip | done |
+| `assemble.py` | concat / off-GPU finish | done |
+| `orchestrator.py` | train, render, export; the render-job entrypoint | done |
 
-The serverless harness (RunPod handler, object-store I/O, model mirroring) plugs in on
-top; the pipeline modules above expose a clean interface it drives.
+The serverless harness (RunPod handler, object-store I/O, model mirroring) lives under
+`harness/` and drives the pipeline modules above through a clean interface. The pipeline
+is proven end-to-end on RunPod serverless (it renders complete films); GPU-validated
+features land tagged, CPU-testable logic is covered by the suite in `tests/`.
 
 ## License
 
