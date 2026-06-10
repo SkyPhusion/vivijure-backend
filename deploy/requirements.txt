@@ -27,14 +27,15 @@ numpy==2.3.5
 Pillow==12.0.0
 PyYAML>=6.0               # contract.py storyboard parse (no version sensitivity)
 
-# --- identity stack (InstantID single-char upgrade) : NOT in v0.1.0 ---
-# The validated render paths use the masked IP-Adapter identity, not InstantID, so these are left
-# out of the image until the InstantID path is actually validated on a pod (insightface also
-# compiles from source, a needless build risk for an unused path). Add back here when validated:
-#   insightface>=0.7
-#   onnxruntime-gpu>=1.20
-# sentencepiece / protobuf are likewise unneeded by the SDXL + Wan stack (transformers ran without
-# them in the validated env); add only if a future tokenizer requires them.
+# --- identity stack (InstantID single-char upgrade) ---
+# Wired in (keyframe._render_instantid via models.instantid_pipeline + the instantid module): the
+# face-keypoints ControlNet + image-projection are in code. These deps put insightface (antelopev2
+# face embedding + landmarks) and its ONNX runtime in the image so the path can be pod-validated.
+# insightface may compile from source on build; pin/prebuild if the build gets slow.
+insightface>=0.7
+onnxruntime-gpu>=1.20
+# sentencepiece / protobuf are unneeded by the SDXL + Wan stack (transformers ran without them in
+# the validated env); add only if a future tokenizer requires them.
 
 # --- serverless SDK + R2 object I/O : floors (import-validated, not render-exercised) ---
 runpod>=1.6

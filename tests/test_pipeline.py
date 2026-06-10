@@ -31,6 +31,22 @@ def test_keyframe_params_draft_is_few_step():
     assert p.scheduler == "ddim_trailing"        # Hyper-SD few-step path pins DDIM trailing
 
 
+def test_keyframe_params_default_identity_is_ip_adapter():
+    p = keyframe_params_from(RenderConfig.for_tier(QualityTier.FINAL))
+    assert p.identity_method == "ip_adapter"   # the default single-char identity path
+
+
+def test_keyframe_params_thread_instantid():
+    cfg = RenderConfig.from_request("final", {"keyframe": {
+        "identity_method": "instantid",
+        "instantid_controlnet_scale": 0.7,
+        "instantid_ip_adapter_scale": 0.9}})
+    p = keyframe_params_from(cfg)
+    assert p.identity_method == "instantid"
+    assert p.instantid_controlnet_scale == 0.7
+    assert p.instantid_ip_adapter_scale == 0.9
+
+
 def test_keyframe_params_pull_multichar_scales():
     cfg = RenderConfig.from_request("final", {"keyframe": {"multi_char": {
         "lora_scale_per_slot": 0.25, "ip_adapter_scale_per_slot": 0.6,

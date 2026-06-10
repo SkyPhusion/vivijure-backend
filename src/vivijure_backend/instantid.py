@@ -1,0 +1,243 @@
+"""InstantID single-character face identity for the keyframe stage.
+
+InstantID raises single-subject face fidelity above the plain IP-Adapter path by combining two
+signals from a reference face, both produced by the public InstantID model (`InstantX/InstantID`):
+
+  1. a face EMBEDDING from insightface (antelopev2), injected through an image-projection
+     (a Resampler) as extra cross-attention tokens, like an IP-Adapter but keyed on identity
+     rather than a CLIP image embed; and
+  2. a face-KEYPOINTS ControlNet, conditioned on the 5 landmarks drawn onto a black canvas, which
+     pins the face's structure/pose.
+
+This module is a clean-room reimplementation built from the published InstantID architecture and
+the diffusers ControlNet / attention-processor interfaces. It shares NOTHING with any prior render
+pipeline. The Resampler dims and the keypoint colour scheme are InstantID's documented public spec.
+
+Only the drawing geometry (`draw_kps`) and the format helpers are pure and CPU-tested; the model
+construction and the per-render call defer torch/diffusers/insightface and are validated on a pod.
+"""
+from __future__ import annotations
+
+# InstantID's published image-projection (Resampler) shape for SDXL: face embedding (512) -> 16
+# identity tokens at the UNet cross-attention dim (2048). These are the model's own documented
+# hyperparameters, not tunable knobs.
+FACE_EMBED_DIM = 512
+NUM_ID_TOKENS = 16
+CROSS_ATTENTION_DIM = 2048
+
+# The 5 antelopev2 landmarks, in order: right eye, left eye, nose, right mouth, left mouth. InstantID
+# draws each as a filled circle and connects them with thin lines on a black canvas; the ControlNet
+# was trained on exactly this colour scheme, so the colours are fixed, not styling.
+KPS_COLORS = [
+    (255, 0, 0),    # right eye
+    (0, 255, 0),    # left eye
+    (0, 0, 255),    # nose
+    (255, 255, 0),  # right mouth corner
+    (255, 0, 255),  # left mouth corner
+]
+
+
+def draw_kps(width: int, height: int, kps, *, dot_radius: int = 0, line_width: int = 0):
+    """Render the 5-point face-keypoints control image InstantID's ControlNet expects: each landmark
+    as a filled circle on black, the eye/nose/mouth points joined by faint limb lines, sized to the
+    canvas. `kps` is a sequence of 5 (x, y) pixel coordinates (insightface order). Pure geometry;
+    PIL is imported lazily so this stays CPU-importable for the unit tests that assert the layout.
+
+    Returns a PIL RGB image. Radii default to a canvas-proportional size when left at 0.
+    """
+    from PIL import Image, ImageDraw
+
+    r = dot_radius or max(2, round(min(width, height) / 128))
+    lw = line_width or max(1, round(min(width, height) / 256))
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    pts = [(float(x), float(y)) for x, y in kps][:5]
+
+    # Limbs: connect the landmarks in the standard InstantID order (eyes joined, each eye to nose,
+    # nose to its mouth corner, mouth corners joined) so the ControlNet sees a face-shaped skeleton.
+    limbs = [(0, 1), (0, 2), (1, 2), (2, 3), (2, 4), (3, 4)]
+    for a, b in limbs:
+        if a < len(pts) and b < len(pts):
+            draw.line([pts[a], pts[b]], fill=(255, 255, 255), width=lw)
+    for i, (x, y) in enumerate(pts):
+        color = KPS_COLORS[i % len(KPS_COLORS)]
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
+    return canvas
+
+
+def largest_face(faces):
+    """Pick the dominant face from an insightface detection list: the one with the largest bounding
+    box (so a background bystander never steals the identity). `faces` items expose `.bbox` (x1, y1,
+    x2, y2). Returns the chosen face, or None for an empty list. Pure: no model imports."""
+    best = None
+    best_area = -1.0
+    for f in faces or []:
+        x1, y1, x2, y2 = (float(v) for v in f.bbox)
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if area > best_area:
+            best, best_area = f, area
+    return best
+
+
+def analyze_face(analyzer, image_path):
+    """Run insightface on a reference image and return (normed_embedding, kps, (width, height)) for
+    its largest face, or None if no face is found. The embedding feeds the image-projection; kps (in
+    the reference's pixel coords, hence the size, so the caller can scale them onto the output canvas)
+    feeds `draw_kps`. GPU/onnxruntime path: deferred imports, validated on a pod."""
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGB")
+    arr = np.array(img)[:, :, ::-1]  # insightface wants BGR
+    face = largest_face(analyzer.get(arr))
+    if face is None:
+        return None
+    return face.normed_embedding, face.kps, img.size
+
+
+def build_image_proj(state_dict):
+    """Construct InstantID's image-projection (a Resampler / perceiver) and load its weights from the
+    `image_proj` sub-dict of `ip-adapter.bin`. The Resampler maps one 512-d face embedding to
+    NUM_ID_TOKENS identity tokens at CROSS_ATTENTION_DIM. Architecture is InstantID's public spec;
+    deferred torch import keeps the module CPU-importable. Validated on a pod."""
+    import torch
+    from torch import nn
+
+    class PerceiverAttention(nn.Module):
+        def __init__(self, dim, dim_head=64, heads=20):
+            super().__init__()
+            self.scale = dim_head ** -0.5
+            self.dim_head = dim_head
+            self.heads = heads
+            inner = dim_head * heads
+            self.norm1 = nn.LayerNorm(dim)
+            self.norm2 = nn.LayerNorm(dim)
+            self.to_q = nn.Linear(dim, inner, bias=False)
+            self.to_kv = nn.Linear(dim, inner * 2, bias=False)
+            self.to_out = nn.Linear(inner, dim, bias=False)
+
+        def forward(self, x, latents):
+            x = self.norm1(x)
+            latents = self.norm2(latents)
+            b, n, _ = latents.shape
+            q = self.to_q(latents)
+            kv = self.to_kv(torch.cat((x, latents), dim=-2)).chunk(2, dim=-1)
+            k, v = kv
+
+            def split(t):
+                return t.reshape(b, t.shape[1], self.heads, self.dim_head).transpose(1, 2)
+
+            q, k, v = map(split, (q, k, v))
+            attn = (q * self.scale) @ (k * self.scale).transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            out = attn @ v
+            out = out.transpose(1, 2).reshape(b, n, -1)
+            return self.to_out(out)
+
+    def feed_forward(dim, mult=4):
+        return nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim * mult, bias=False),
+                             nn.GELU(), nn.Linear(dim * mult, dim, bias=False))
+
+    class Resampler(nn.Module):
+        def __init__(self, dim=1280, depth=4, dim_head=64, heads=20, num_queries=NUM_ID_TOKENS,
+                     embedding_dim=FACE_EMBED_DIM, output_dim=CROSS_ATTENTION_DIM, ff_mult=4):
+            super().__init__()
+            self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim ** 0.5)
+            self.proj_in = nn.Linear(embedding_dim, dim)
+            self.proj_out = nn.Linear(dim, output_dim)
+            self.norm_out = nn.LayerNorm(output_dim)
+            self.layers = nn.ModuleList(
+                [nn.ModuleList([PerceiverAttention(dim, dim_head, heads), feed_forward(dim, ff_mult)])
+                 for _ in range(depth)])
+
+        def forward(self, x):
+            latents = self.latents.repeat(x.size(0), 1, 1)
+            x = self.proj_in(x)
+            for attn, ff in self.layers:
+                latents = attn(x, latents) + latents
+                latents = ff(latents) + latents
+            return self.norm_out(self.proj_out(latents))
+
+    model = Resampler()
+    model.load_state_dict(state_dict, strict=False)
+    return model
+
+
+def faceid_tokens(image_proj, face_embedding):
+    """Project a single insightface face embedding into the InstantID identity tokens the UNet's
+    IP-Adapter cross-attention consumes. Deferred torch; validated on a pod."""
+    import torch
+
+    emb = torch.as_tensor(face_embedding, dtype=image_proj.proj_in.weight.dtype,
+                          device=image_proj.proj_in.weight.device).reshape(1, 1, FACE_EMBED_DIM)
+    with torch.no_grad():
+        return image_proj(emb)
+
+
+def set_instantid_ip_attn(unet, ip_state_dict, *, num_tokens: int = NUM_ID_TOKENS, scale: float = 0.8):
+    """Wire InstantID's identity tokens into the UNet cross-attention. Replaces each cross-attention
+    processor with an IP-Adapter processor that adds a second attention over the `num_tokens`
+    identity tokens (the projected face embedding) and sums it into the text attention at `scale`;
+    self-attention layers keep the default processor. Weights come from the `ip_adapter` sub-dict of
+    InstantID's `ip-adapter.bin`. Built from the documented IP-Adapter attention-processor interface
+    in diffusers; deferred imports, validated on a pod.
+
+    Returns the dict of installed identity processors so the caller can retune `scale` per render
+    without rebuilding them.
+    """
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
+
+    class IPAttnProcessor(nn.Module):
+        def __init__(self, hidden_size, cross_attention_dim, num_tokens, scale):
+            super().__init__()
+            self.num_tokens = num_tokens
+            self.scale = scale
+            self.to_k_ip = nn.Linear(cross_attention_dim, hidden_size, bias=False)
+            self.to_v_ip = nn.Linear(cross_attention_dim, hidden_size, bias=False)
+
+        def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kw):
+            residual = hidden_states
+            if encoder_hidden_states is None:
+                encoder_hidden_states = hidden_states
+            # Split the prompt tokens from the appended identity tokens.
+            end = encoder_hidden_states.shape[1] - self.num_tokens
+            txt, ip = encoder_hidden_states[:, :end, :], encoder_hidden_states[:, end:, :]
+            q = attn.to_q(hidden_states)
+            k, v = attn.to_k(txt), attn.to_v(txt)
+            heads, dim = attn.heads, q.shape[-1] // attn.heads
+
+            def shape(t):
+                return t.view(t.shape[0], t.shape[1], heads, dim).transpose(1, 2)
+
+            out = F.scaled_dot_product_attention(shape(q), shape(k), shape(v))
+            ip_out = F.scaled_dot_product_attention(shape(q), shape(self.to_k_ip(ip)), shape(self.to_v_ip(ip)))
+            out = out + self.scale * ip_out
+            out = out.transpose(1, 2).reshape(out.shape[0], -1, heads * dim)
+            out = attn.to_out[1](attn.to_out[0](out))
+            return out + residual if attn.residual_connection else out
+
+    procs = {}
+    installed = {}
+    for name in unet.attn_processors.keys():
+        if not name.endswith("attn2.processor"):  # cross-attention only
+            procs[name] = unet.attn_processors[name]
+            continue
+        if name.startswith("mid_block"):
+            hidden = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            i = int(name[len("up_blocks.")])
+            hidden = list(reversed(unet.config.block_out_channels))[i]
+        else:
+            i = int(name[len("down_blocks.")])
+            hidden = unet.config.block_out_channels[i]
+        p = IPAttnProcessor(hidden, CROSS_ATTENTION_DIM, num_tokens, scale).to(
+            device=unet.device, dtype=unet.dtype)
+        procs[name] = p
+        installed[name] = p
+    unet.set_attn_processor(procs)
+    # Load the trained ip projections (keys are ordered to match the cross-attention layers).
+    weights = nn.ModuleList(installed.values())
+    weights.load_state_dict(ip_state_dict, strict=False)
+    return installed

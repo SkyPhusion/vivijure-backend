@@ -7,6 +7,29 @@ releases are summarized below from that history.
 
 ## Unreleased
 
+**InstantID single-character face identity (the consistent-identity lever).** Wires the
+scaffolded-but-dead InstantID path into the GPU keyframe stage: for a single-character shot with
+`identity_method="instantid"` and a reference face, the keyframe now uses insightface (antelopev2)
+to extract a face embedding + 5 keypoints, projects the embedding to identity tokens through a
+Resampler image-projection, injects them via IP cross-attention processors, and conditions a
+second (InstantID) ControlNet on the keypoints to pin face structure. Built as its own
+`instantid_pipeline()` on a fresh SDXL base (no entanglement with the shared keyframe pipe's
+per-scene LoRA / IP-Adapter state), sharing the few-step distill attach so single-char drafts stay
+cheap. Multi-character shots and the default IP-Adapter single path are untouched. The face-keypoint
+geometry and face selection are pure + unit-tested; the model construction, attn-processor wiring,
+and per-render embed-concat defer their imports and are GPU-validation-pending (the parts to eyeball:
+the ip-adapter.bin key mapping, the identity-token concat, and the insightface antelopev2 path).
+Clean-room: built from the published InstantID architecture + diffusers interfaces, no prior pipeline.
+
+Code: new `instantid.py` (Resampler image-proj, IP attn processor, kps drawing, face analysis),
+`models.py` (`face_analyzer`, `instantid_pipeline`, `_attach_keyframe_distill` shared with
+`keyframe_pipeline`), `keyframe.py` (`_render_instantid` + the single-char InstantID branch),
+`pipeline.py` (thread `identity_method` + instantid scales), `KeyframeParams` fields,
+`deploy/requirements.txt` (insightface + onnxruntime-gpu), `tests/test_instantid.py` +
+`tests/test_pipeline.py`. CPU suite green.
+
+## backend-v0.1.16
+
 **Wire the few-step keyframe distill into the GPU path (the speed lever).** The tier config
 already asked draft/standard for a 4/8-step, cfg=0, DDIM-trailing keyframe, but the pipeline
 never loaded the Hyper-SD distill LoRA, never set the scheduler, and the `few_step` flag was
@@ -15,8 +38,10 @@ stills). Now the ModelServer loads the Hyper-SDXL distill LoRA as a persistent b
 ("distill"), `keyframe._bind_loras` gates its weight on the tier (1.0 on draft/standard, 0.0
 on final, so one warm pipe serves every tier with no reload), and `keyframe._apply_scheduler`
 pins DDIM-trailing for the few-step path and restores a full-step solver for final. The final
-tier is untouched; this speeds up previews (the most-repeated op). GPU-validation pending: the
-single 8-step distill LoRA driving a 4-step draft is the thing to eyeball.
+tier is untouched; this speeds up previews (the most-repeated op). Validated green on a pod
+(2026-06-10): a draft keyframes-only render of all 10 neon_halflife shots came out sharp at
+4-step, including the multi-character frames; the feared "8-step LoRA at 4-step draft = soft"
+did not happen, so it ships as-is.
 
 Code: `models.py` (ModelSpec.weight_name; load the distill LoRA in `keyframe_pipeline`),
 `keyframe.py` (DISTILL_ADAPTER, `KeyframeParams.scheduler`, `_apply_scheduler`, few-step gating
