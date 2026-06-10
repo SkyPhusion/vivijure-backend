@@ -7,12 +7,29 @@ releases are summarized below from that history.
 
 ## Unreleased
 
+**Wire the few-step keyframe distill into the GPU path (the speed lever).** The tier config
+already asked draft/standard for a 4/8-step, cfg=0, DDIM-trailing keyframe, but the pipeline
+never loaded the Hyper-SD distill LoRA, never set the scheduler, and the `few_step` flag was
+dead, so draft previews ran few-step *without* the LoRA that makes few-step work (degraded
+stills). Now the ModelServer loads the Hyper-SDXL distill LoRA as a persistent base adapter
+("distill"), `keyframe._bind_loras` gates its weight on the tier (1.0 on draft/standard, 0.0
+on final, so one warm pipe serves every tier with no reload), and `keyframe._apply_scheduler`
+pins DDIM-trailing for the few-step path and restores a full-step solver for final. The final
+tier is untouched; this speeds up previews (the most-repeated op). GPU-validation pending: the
+single 8-step distill LoRA driving a 4-step draft is the thing to eyeball.
+
+Code: `models.py` (ModelSpec.weight_name; load the distill LoRA in `keyframe_pipeline`),
+`keyframe.py` (DISTILL_ADAPTER, `KeyframeParams.scheduler`, `_apply_scheduler`, few-step gating
+in `_bind_loras`), `pipeline.py` (thread `scheduler` through `keyframe_params_from`),
+`tests/test_keyframe.py` + `tests/test_pipeline.py` (distill-weight + scheduler mapping).
+Full suite green.
+
 Public-readiness housekeeping ahead of open-sourcing the repository: added
 `CONTRIBUTING.md` (clean-room / independence-protective posture, house rules, DCO),
 `SECURITY.md` (private vulnerability reporting + the render-backend security boundary),
 `CODE_OF_CONDUCT.md`, and this `CHANGELOG.md`. Corrected the README architecture table to
 reflect the shipped pipeline, and removed em-dashes from the README to match the house
-style. No code changes.
+style.
 
 ## backend-v0.1.15
 

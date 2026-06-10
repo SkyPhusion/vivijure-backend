@@ -52,6 +52,7 @@ def keyframe_params_from(config: RenderConfig) -> KeyframeParams:
         resolution=kc.width,                       # engine renders square; width is the side
         seed=kc.seed,
         few_step=kc.distill,
+        scheduler=kc.scheduler.value,              # ddim_trailing on the few-step path, a solver on final
         lora_scale=mc.lora_scale_per_slot,
         ip_adapter_scale=mc.ip_adapter_scale_per_slot,
         pose_conditioning=mc.pose_conditioning,
