@@ -50,6 +50,12 @@ class KeyframeParams:
     scheduler: str = "ddim_trailing" # config.Scheduler value; few-step wants ddim_trailing, final a solver
     lora_scale: float = DEFAULT_LORA_SCALE
     ip_adapter_scale: float = DEFAULT_IP_ADAPTER_SCALE
+    # Identity method for the SINGLE-character path: "ip_adapter" (h94 IP-Adapter, the default) or
+    # "instantid" (insightface face-embed + the InstantID face-keypoints ControlNet, higher face
+    # fidelity). Multi-character shots ignore this and always take the masked-IP-Adapter regional path.
+    identity_method: str = "ip_adapter"
+    instantid_controlnet_scale: float = 0.8  # InstantID face-keypoints ControlNet conditioning scale
+    instantid_ip_adapter_scale: float = 0.8  # InstantID face-embedding (image-proj) scale
     pose_conditioning: bool = True   # ControlNet-OpenPose to separate bodies in multi-char shots
     controlnet_pose_scale: float = 0.55  # OpenPose ControlNet conditioning scale (regional path)
     region_gutter: int = 64          # px dead band between regional masks so they do not seam-blend
@@ -157,15 +163,23 @@ def render_keyframe(
 
     import torch  # deferred: keep this module CPU-importable
 
-    pipe = server.keyframe_pipeline()
-    _apply_scheduler(pipe, cfg)
-    generator = torch.Generator(device="cuda").manual_seed(cfg.seed)
     loras = {s: Path(p) for s, p in (lora_paths or {}).items()}
+    single_slot = scene.character_slots[0] if scene.character_slots else None
 
-    if engine == "single":
-        image = _render_single(pipe, prompt, scene, cast, cfg, loras, generator)
+    # Single-character + identity_method "instantid" + a real reference face -> the InstantID pipe
+    # (its own SDXL + face-keypoints ControlNet + face-embedding injection). Everything else (the
+    # default IP-Adapter single path, and all multi-character shots) takes the shared keyframe pipe.
+    if engine == "single" and cfg.identity_method == "instantid" and single_slot is not None \
+            and _ref_images(cast, single_slot, count=1):
+        image = _render_instantid(server, prompt, scene, cast, cfg, loras, single_slot)
     else:
-        image = _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_image)
+        pipe = server.keyframe_pipeline()
+        _apply_scheduler(pipe, cfg)
+        generator = torch.Generator(device="cuda").manual_seed(cfg.seed)
+        if engine == "single":
+            image = _render_single(pipe, prompt, scene, cast, cfg, loras, generator)
+        else:
+            image = _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_image)
 
     image.save(out_path)
     return KeyframeResult(shot_id=scene.id or "shot", path=out_path, slots=slots,
@@ -241,6 +255,53 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
         cross_attention_kwargs={"ip_adapter_masks": masks},
         image=control,
         controlnet_conditioning_scale=cn_scale,
+    ).images[0]
+
+
+def _render_instantid(server, prompt, scene, cast, cfg, loras, slot):
+    """Single-character InstantID keyframe: the slot's reference face drives both a face-embedding
+    injection (projected to identity tokens, fed through the IP cross-attention) and a face-keypoints
+    ControlNet that pins the face structure. The slot's character LoRA still binds for body/style.
+
+    A stock SDXL ControlNet pipe does not know to append InstantID's identity tokens to the prompt
+    embeds, so we encode the prompt explicitly and concatenate the tokens (zeros on the uncond side);
+    every cross-attention is an IPAttnProcessor that splits the text tokens from the identity tokens.
+    GPU body, validated on a pod (the embed-concat + ControlNet conditioning are what to eyeball)."""
+    import torch
+    from . import instantid as _iid
+
+    pipe = server.instantid_pipeline()
+    _apply_scheduler(pipe, cfg)
+    generator = torch.Generator(device="cuda").manual_seed(cfg.seed)
+    _bind_loras(pipe, {slot: loras[slot]} if slot in loras else {}, cfg.lora_scale,
+                few_step=cfg.few_step)
+
+    # Identity from the reference face: embedding -> identity tokens, keypoints -> control image.
+    ref = _ref_images(cast, slot, count=1)[0]
+    analyzed = _iid.analyze_face(server.face_analyzer(), ref)
+    if analyzed is None:  # no face detected: fall back to the plain IP-Adapter single path
+        return _render_single(pipe, prompt, scene, cast, cfg, loras, generator)
+    embedding, kps, (rw, rh) = analyzed
+    res = cfg.resolution
+    sx, sy = res / max(1, rw), res / max(1, rh)
+    kps_image = _iid.draw_kps(res, res, [(x * sx, y * sy) for x, y in kps])
+    id_tokens = _iid.faceid_tokens(pipe._vj_image_proj, embedding)
+
+    # Retune the IP cross-attention strength for this render, then build prompt embeds with the
+    # identity tokens appended (uncond side gets zeros so CFG does not hallucinate an identity).
+    for proc in pipe._vj_id_attn.values():
+        proc.scale = cfg.instantid_ip_adapter_scale
+    pe, npe, pooled, npooled = pipe.encode_prompt(
+        prompt=prompt, negative_prompt=cfg.negative_prompt, device="cuda",
+        num_images_per_prompt=1, do_classifier_free_guidance=True)
+    pe = torch.cat([pe, id_tokens.to(pe.dtype)], dim=1)
+    npe = torch.cat([npe, torch.zeros_like(id_tokens).to(npe.dtype)], dim=1)
+    return pipe(
+        prompt_embeds=pe, negative_prompt_embeds=npe,
+        pooled_prompt_embeds=pooled, negative_pooled_prompt_embeds=npooled,
+        num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
+        height=res, width=res, generator=generator,
+        image=kps_image, controlnet_conditioning_scale=cfg.instantid_controlnet_scale,
     ).images[0]
 
 

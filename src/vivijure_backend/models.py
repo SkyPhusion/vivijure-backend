@@ -153,20 +153,79 @@ class ModelServer:
         # Load the Hyper-SD few-step distill LoRA as a persistent BASE adapter (named "distill", NOT
         # fused -- unlike i2v, the keyframe pipe stays bf16 so dynamic per-scene character LoRAs can
         # still attach). keyframe._bind_loras keeps it active at weight 1.0 on draft/standard and 0.0
-        # on final, so one warm pipe serves every tier. A load failure degrades to full-step keyframes
-        # rather than crashing the worker.
-        few = self.specs.get(ModelRole.KEYFRAME_FEWSTEP)
-        pipe._vj_distill = None
-        if few is not None:
-            try:
-                pipe.load_lora_weights(few.repo_id, weight_name=few.weight_name, adapter_name="distill")
-                pipe._vj_distill = "distill"
-            except Exception as e:  # noqa: BLE001 -- never let a finicky distill load down the worker
-                print(f"keyframe distill LoRA load failed ({few.repo_id} / {few.weight_name}): {e}; "
-                      "full-step keyframes only.")
+        # on final, so one warm pipe serves every tier.
+        self._attach_keyframe_distill(pipe)
 
         self._cache["keyframe"] = pipe
         return pipe
+
+    def face_analyzer(self):
+        """insightface FaceAnalysis on the antelopev2 pack (mirrored to <VJ_MODELS_ROOT>/antelopev2
+        on cold start) for InstantID: yields a face embedding + 5 keypoints from a reference face.
+        insightface resolves a pack at `<root>/models/<name>`, so its root is the PARENT of the
+        mirror's models_root (antelopev2 sits one level up from `<root>/models/`). Cached; deferred
+        imports keep this module CPU-importable; validated on a pod (insightface path + onnxruntime
+        provider selection are environment-finicky)."""
+        if "face_analyzer" in self._cache:
+            return self._cache["face_analyzer"]
+        import os
+        from insightface.app import FaceAnalysis
+
+        models_root = os.environ.get("VJ_MODELS_ROOT", "/opt/models")
+        root = os.path.dirname(models_root.rstrip("/")) or "/"
+        app = FaceAnalysis(name="antelopev2", root=root,
+                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        self._cache["face_analyzer"] = app
+        return app
+
+    def instantid_pipeline(self):
+        """InstantID single-character pipeline: the InstantID face-keypoints ControlNet on a fresh
+        SDXL base (its own components, so the per-scene character-LoRA + IP-attn state never tangles
+        with the shared keyframe pipe), plus the InstantID image-projection (Resampler) and the IP
+        cross-attention processors that inject the insightface face embedding. The few-step distill
+        adapter is attached the same way as the keyframe pipe so single-char drafts stay cheap.
+        keyframe._render_instantid drives it. Validated on a pod (the attn-processor wiring + the
+        ip-adapter.bin key mapping are the parts to eyeball)."""
+        if "instantid" in self._cache:
+            return self._cache["instantid"]
+        import torch
+        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
+        from huggingface_hub import hf_hub_download
+        from . import instantid as _iid
+
+        base = self.specs[ModelRole.KEYFRAME_BASE]
+        id_spec = self.specs[ModelRole.INSTANTID]
+        controlnet = ControlNetModel.from_pretrained(
+            id_spec.repo_id, subfolder="ControlNetModel", torch_dtype=torch.bfloat16)
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            base.repo_id, controlnet=controlnet, torch_dtype=torch.bfloat16)
+        pipe.to("cuda")
+        _set_attention(pipe, self.device)
+        pipe._vj_default_scheduler = pipe.scheduler
+        self._attach_keyframe_distill(pipe)
+
+        # Identity injection: project the face embedding (Resampler) and wire the IP cross-attention.
+        ckpt = torch.load(hf_hub_download(id_spec.repo_id, "ip-adapter.bin"), map_location="cpu")
+        pipe._vj_image_proj = _iid.build_image_proj(ckpt["image_proj"]).to("cuda", torch.bfloat16)
+        pipe._vj_id_attn = _iid.set_instantid_ip_attn(pipe.unet, ckpt["ip_adapter"])
+        self._cache["instantid"] = pipe
+        return pipe
+
+    def _attach_keyframe_distill(self, pipe):
+        """Load the Hyper-SD few-step distill LoRA as a persistent base adapter "distill" on a
+        keyframe-style SDXL pipe (shared by keyframe_pipeline and instantid_pipeline). A finicky
+        load degrades to full-step rather than crashing the worker."""
+        pipe._vj_distill = None
+        few = self.specs.get(ModelRole.KEYFRAME_FEWSTEP)
+        if few is None:
+            return
+        try:
+            pipe.load_lora_weights(few.repo_id, weight_name=few.weight_name, adapter_name="distill")
+            pipe._vj_distill = "distill"
+        except Exception as e:  # noqa: BLE001 -- never let a finicky distill load down the worker
+            print(f"keyframe distill LoRA load failed ({few.repo_id} / {few.weight_name}): {e}; "
+                  "full-step keyframes only.")
 
     def i2v_pipeline(self):
         """Wan 2.2 image-to-video: load bf16, quantize the MoE transformers to fp8 with torchao on
