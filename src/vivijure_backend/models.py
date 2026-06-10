@@ -168,38 +168,60 @@ class ModelServer:
         provider selection are environment-finicky)."""
         if "face_analyzer" in self._cache:
             return self._cache["face_analyzer"]
+        import glob
         import os
+        import shutil
         from insightface.app import FaceAnalysis
 
         models_root = os.environ.get("VJ_MODELS_ROOT", "/opt/models")
         root = os.path.dirname(models_root.rstrip("/")) or "/"
-        app = FaceAnalysis(name="antelopev2", root=root,
-                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+
+        # antelopev2.zip extracts one level too deep (`<dir>/antelopev2/*.onnx`), but insightface
+        # scans `<dir>/*.onnx` -> "assert 'detection' in self.models". Flatten the nested pack so both
+        # the auto-download and a flat R2-mirror layout work. (Runs before AND would-be after the
+        # download, so a fresh pull that nests is recovered on the retry below.)
+        def _flatten_antelope():
+            mdir = os.path.join(root, "models", "antelopev2")
+            nested = os.path.join(mdir, "antelopev2")
+            if os.path.isdir(nested) and not glob.glob(os.path.join(mdir, "*.onnx")):
+                for f in glob.glob(os.path.join(nested, "*")):
+                    shutil.move(f, mdir)
+
+        _flatten_antelope()
+        try:
+            app = FaceAnalysis(name="antelopev2", root=root,
+                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        except AssertionError:
+            _flatten_antelope()  # the just-finished download nested it; flatten and retry once
+            app = FaceAnalysis(name="antelopev2", root=root,
+                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
         app.prepare(ctx_id=0, det_size=(640, 640))
         self._cache["face_analyzer"] = app
         return app
 
     def instantid_pipeline(self):
-        """InstantID single-character pipeline: the InstantID face-keypoints ControlNet on a fresh
-        SDXL base (its own components, so the per-scene character-LoRA + IP-attn state never tangles
-        with the shared keyframe pipe), plus the InstantID image-projection (Resampler) and the IP
-        cross-attention processors that inject the insightface face embedding. The few-step distill
-        adapter is attached the same way as the keyframe pipe so single-char drafts stay cheap.
-        keyframe._render_instantid drives it. Validated on a pod (the attn-processor wiring + the
-        ip-adapter.bin key mapping are the parts to eyeball)."""
+        """InstantID single-character pipeline: a plain SDXL base whose UNet cross-attention is
+        augmented with InstantID's face-embedding IP-Adapter (the insightface embedding -> identity
+        tokens via the Resampler image-projection, injected through the IP attn side channel). Its own
+        components so the per-scene character-LoRA + IP-attn state never tangles with the shared
+        keyframe pipe; shares the few-step distill attach so single-char drafts stay cheap.
+        keyframe._render_instantid drives it.
+
+        NOTE: this uses InstantID's identity IP-Adapter ONLY, not the IdentityNet (face-keypoints)
+        ControlNet. The IdentityNet must receive the face embedding as its encoder_hidden_states (a
+        custom unet+controlnet denoise loop the stock pipeline does not expose); fed the text embeds it
+        produces noise, and for a scene-posed character keyframe the face-pose lock it adds is usually
+        undesirable. The IdentityNet is a documented future enhancement (draw_kps is kept for it)."""
         if "instantid" in self._cache:
             return self._cache["instantid"]
         import torch
-        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
+        from diffusers import StableDiffusionXLPipeline
         from huggingface_hub import hf_hub_download
         from . import instantid as _iid
 
         base = self.specs[ModelRole.KEYFRAME_BASE]
         id_spec = self.specs[ModelRole.INSTANTID]
-        controlnet = ControlNetModel.from_pretrained(
-            id_spec.repo_id, subfolder="ControlNetModel", torch_dtype=torch.bfloat16)
-        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-            base.repo_id, controlnet=controlnet, torch_dtype=torch.bfloat16)
+        pipe = StableDiffusionXLPipeline.from_pretrained(base.repo_id, torch_dtype=torch.bfloat16)
         pipe.to("cuda")
         _set_attention(pipe, self.device)
         pipe._vj_default_scheduler = pipe.scheduler

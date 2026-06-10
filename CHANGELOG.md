@@ -7,6 +7,35 @@ releases are summarized below from that history.
 
 ## Unreleased
 
+**fix(instantid): make the InstantID path actually render (pod-validated 2026-06-10).** The 0.1.17
+wiring loaded but produced noise; debugged live on an A6000 and validated end to end (a clean,
+identity-matched anime keyframe). The fixes:
+
+- The `ip_adapter` weights are keyed by each layer's index over ALL attn processors (self + cross),
+  not the cross-only subset: load each cross-attention's `to_k_ip`/`to_v_ip` by its overall index.
+  (The previous ModuleList-over-cross-only compressed the indices and mismatched the per-layer
+  hidden sizes.)
+- Identity tokens reach the UNet through a SIDE channel (`proc.id_embeds`), NOT concatenated onto the
+  prompt embeds: concatenation corrupted the ControlNet, which never saw appended tokens.
+- Dropped the InstantID IdentityNet (face-keypoints) ControlNet. It must receive the face embedding
+  as its `encoder_hidden_states` (a custom unet+controlnet denoise loop the stock pipeline does not
+  expose); fed the text embeds it produces noise, and the face-pose lock is undesirable for a
+  scene-posed keyframe. `instantid_pipeline` is now a plain SDXL pipe with the face IP-Adapter only;
+  the IdentityNet is documented future work (`draw_kps` kept for it).
+- `face_analyzer` auto-flattens the antelopev2 pack (the zip extracts one level too deep) with a
+  download-retry.
+- `analyze_face` accepts a PIL Image (what `_ref_images` returns), not only a path.
+
+Identity transfers best in-domain (anime ref + anime base, or a real-face ref); insightface
+antelopev2 is real-face-trained, so an anime ref is its hardest case (it still works). In production
+the cast LoRA stacks on top to lock hair/outfit while InstantID locks the face.
+
+Code: `instantid.py` (index-based IP-attn load, side-channel `IPAttnProcessor`, PIL `analyze_face`),
+`models.py` (`instantid_pipeline` -> plain SDXL, `face_analyzer` flatten+retry), `keyframe.py`
+(`_render_instantid` side channel, no ControlNet). CPU suite green; validated on an A6000.
+
+## backend-v0.1.17
+
 **InstantID single-character face identity (the consistent-identity lever).** Wires the
 scaffolded-but-dead InstantID path into the GPU keyframe stage: for a single-character shot with
 `identity_method="instantid"` and a reference face, the keyframe now uses insightface (antelopev2)
