@@ -18,7 +18,7 @@
 // Credentials: ghcr-skyphusion (username/PAT with write:packages).
 
 pipeline {
-    agent any
+    agent { label 'build' }
 
     options {
         // CUDA + torch cu128 + diffusers is a heavy from-scratch build; a cache-warm rebuild
