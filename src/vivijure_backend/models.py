@@ -36,6 +36,8 @@ class ModelRole(str, Enum):
     INSTANTID = "instantid"              # face identity (insightface + ControlNet)
     IP_ADAPTER = "ip_adapter"            # per-slot identity conditioning
     CONTROLNET_POSE = "controlnet_pose"  # OpenPose: separates bodies in multi-char shots
+    FRAME_INTERP = "frame_interp"        # RIFE: finishing-stage frame interpolation (16fps -> smooth)
+    FACE_RESTORE = "face_restore"        # blind face restorer: relock identity over the i2v frames
 
 
 class ModelFamily(str, Enum):
@@ -83,6 +85,20 @@ DEFAULT_SPECS: dict[ModelRole, ModelSpec] = {
     ModelRole.IP_ADAPTER: ModelSpec(ModelRole.IP_ADAPTER, "h94/IP-Adapter", ModelFamily.AUX),
     ModelRole.CONTROLNET_POSE: ModelSpec(
         ModelRole.CONTROLNET_POSE, "xinsir/controlnet-openpose-sdxl-1.0", ModelFamily.AUX,
+    ),
+    ModelRole.FRAME_INTERP: ModelSpec(
+        ModelRole.FRAME_INTERP, "imaginairy/rife", ModelFamily.AUX,
+        weight_name="flownet.pkl",
+        note="RIFE recursive-2x frame interpolation for the finishing stage (Practical-RIFE / "
+             "ECCV2022-RIFE weights, MIT -- redistribution-clean). Light next to i2v.",
+    ),
+    ModelRole.FACE_RESTORE: ModelSpec(
+        ModelRole.FACE_RESTORE, "TencentARC/GFPGANv1.4", ModelFamily.AUX,
+        weight_name="GFPGANv1.4.pth",
+        note="blind face restorer for the finishing stage (relock identity over the i2v frames). "
+             "GFPGAN is the default; CodeFormer (sczhou/CodeFormer) is higher quality but S-Lab "
+             "NON-COMMERCIAL, so it is a deploy-time spec swap, never the bundled default. "
+             "VERIFY the chosen model's license before seeding its weights to R2.",
     ),
 }
 

@@ -322,6 +322,71 @@ class I2VConfig:
         return asdict(self)
 
 
+# ------------------------------------------------------------------------------- finish
+
+class FaceRestore(str, Enum):
+    """Which blind face restorer relocks the face over the i2v frames. NONE is off; the others name
+    a model role the ModelServer loads. GFPGAN is the redistribution-clean default; CodeFormer is
+    higher quality but ships under the S-Lab non-commercial license (so it is an opt-in the deployer
+    chooses, NOT bundled by default -- same posture as the antelopev2 pack). The face_fidelity knob
+    maps to the restorer's restoration/fidelity balance."""
+    NONE = "none"
+    GFPGAN = "gfpgan"
+    CODEFORMER = "codeformer"
+
+
+@dataclass
+class FinishConfig:
+    """Post-i2v finishing-stage config: the two clip-in/clip-out passes that run on the GPU worker
+    after each shot animates and before the off-GPU assemble merges them (see `finish.py`).
+
+    `interpolate` turns on RIFE frame interpolation; `interpolation_factor` is the recursive 2x
+    multiple (2/4/8, snapped to a power of two) and `target_fps` (when > 0) caps the realized rate.
+    `face_restore` selects a blind face restorer (off by default) that relocks the character's face
+    over the motion frames; `face_fidelity` is its restoration/fidelity balance and `only_faces`
+    keeps it to the detected faces.
+
+    Built tier-aware via `for_tier`: draft finishes nothing (a fast preview), standard interpolates
+    to smooth motion, final interpolates AND face-restores for the hero deliverable. Mirrors the
+    namespaced `render_overrides` `{"finish": {...}}` section; parsing stays forgiving + clamped."""
+    interpolate: bool = False
+    interpolation_factor: int = 2     # 1/2/4/8; recursive RIFE doubling (1 = off)
+    target_fps: int = 0               # 0 = src*factor; else a hard cap on the realized fps
+    face_restore: FaceRestore = FaceRestore.NONE
+    face_fidelity: float = 0.7        # 0..1; restorer balance (0 = max restoration, 1 = max fidelity)
+    only_faces: bool = True           # restore detected faces only, leave the rest of the frame alone
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the finish stage runs at all for this render. When neither pass is on, the
+        pipeline never calls `finish_clip` and the raw i2v clips ship unchanged."""
+        return bool(self.interpolate or self.face_restore is not FaceRestore.NONE)
+
+    @classmethod
+    def for_tier(cls, tier: QualityTier) -> "FinishConfig":
+        if tier is QualityTier.DRAFT:
+            return cls()  # a draft is a preview; do not spend GPU finishing it
+        if tier is QualityTier.STANDARD:
+            return cls(interpolate=True, interpolation_factor=2)  # smooth motion, no restore
+        return cls(interpolate=True, interpolation_factor=2, face_restore=FaceRestore.GFPGAN)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None, *, tier: QualityTier | None = None) -> "FinishConfig":
+        base = cls.for_tier(tier) if tier is not None else cls()
+        d = d if isinstance(d, dict) else {}
+        return cls(
+            interpolate=bool(d.get("interpolate", base.interpolate)),
+            interpolation_factor=_clamp_int(d.get("interpolation_factor"), 1, 8, base.interpolation_factor),
+            target_fps=_clamp_int(d.get("target_fps"), 0, 120, base.target_fps),
+            face_restore=_enum_or(FaceRestore, d.get("face_restore"), base.face_restore),
+            face_fidelity=_clamp(d.get("face_fidelity"), 0.0, 1.0, base.face_fidelity),
+            only_faces=bool(d.get("only_faces", base.only_faces)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 # ------------------------------------------------------------------------------- LoRA
 
 def _lora_from_dict(d: dict[str, Any] | None):
@@ -374,6 +439,7 @@ class RenderConfig:
     quality: QualityTier = QualityTier.FINAL
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     i2v: I2VConfig = field(default_factory=I2VConfig)
+    finish: FinishConfig = field(default_factory=FinishConfig)
     lora: Any = field(default_factory=_default_lora)  # lora_train.LoraTrainConfig (deferred type)
 
     @classmethod
@@ -382,6 +448,7 @@ class RenderConfig:
             quality=tier,
             keyframe=KeyframeConfig.for_tier(tier),
             i2v=I2VConfig.for_tier(tier),
+            finish=FinishConfig.for_tier(tier),
             lora=_default_lora(),
         )
 
@@ -395,6 +462,7 @@ class RenderConfig:
             quality=tier,
             keyframe=KeyframeConfig.from_dict(d.get("keyframe"), tier=tier),
             i2v=I2VConfig.from_dict(d.get("i2v"), tier=tier),
+            finish=FinishConfig.from_dict(d.get("finish"), tier=tier),
             lora=_lora_from_dict(d.get("lora")),
         )
 
@@ -403,5 +471,6 @@ class RenderConfig:
             "quality": self.quality.value,
             "keyframe": self.keyframe.to_dict(),
             "i2v": self.i2v.to_dict(),
+            "finish": self.finish.to_dict(),
             "lora": asdict(self.lora),
         }

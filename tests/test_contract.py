@@ -199,3 +199,10 @@ def test_bundle_rejects_path_traversal(tmp_path):
     tar = _make_bundle(tmp_path, {"../escape.txt": b"pwned", "storyboard.yaml": b"{}"})
     with pytest.raises(ValueError):
         Bundle.extract(tar, tmp_path / "out")
+
+
+def test_render_request_parses_audio_key():
+    req = RenderRequest.from_dict(
+        {"action": "render", "project": "p", "bundle_key": "b", "audio_key": "audio/x.m4a"})
+    assert req.audio_key == "audio/x.m4a"
+    assert RenderRequest.from_dict({"project": "p"}).audio_key is None

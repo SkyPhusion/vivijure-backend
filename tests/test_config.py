@@ -183,5 +183,5 @@ def test_render_config_lora_clamps_out_of_range():
 def test_render_config_to_dict_is_json_shaped():
     d = RenderConfig.for_tier(QualityTier.STANDARD).to_dict()
     assert d["quality"] == "standard"
-    assert set(d) == {"quality", "keyframe", "i2v", "lora"}
+    assert set(d) == {"quality", "keyframe", "i2v", "finish", "lora"}
     assert isinstance(d["keyframe"]["scheduler"], str)  # enums flattened to their wire value
