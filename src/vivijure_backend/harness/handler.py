@@ -201,6 +201,18 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     ordered = order_for_storyboard(
         [ClipInput(shot_id=s, path=Path(p)) for s, p in outputs.clips], bundle.storyboard)
 
+    # Audio bed: the pipeline's own track if it made one, else the job's audio_key fetched from the
+    # store. Best-effort -- a missing/failed audio fetch records a marker and ships the video silent
+    # rather than failing the whole render.
+    audio_path = outputs.audio
+    if audio_path is None and req.audio_key:
+        try:
+            audio_dest = workdir / ("audio" + (Path(req.audio_key).suffix or ".m4a"))
+            store.get_file(req.audio_key, audio_dest)
+            audio_path = audio_dest
+        except Exception as e:  # noqa: BLE001 -- audio is optional; never fail the render on it
+            progress.emit("audio_missing", key=req.audio_key, error=str(e)[:200])
+
     offloaded = bool(req.overrides.get("finish_offloaded"))
     if offloaded:
         # Off-GPU finish elsewhere: emit per-shot clips + a manifest, no merge here.
@@ -209,7 +221,7 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
                                  content_type="video/mp4", metadata=owner_meta)
             result.clips.append(Clip(shot_id=c.shot_id, key=key))
         manifest = build_manifest(ordered, output_name="full.mp4",
-                                  audio=str(outputs.audio) if outputs.audio else None)
+                                  audio=str(audio_path) if audio_path else None)
         man_path = write_manifest(manifest, workdir / "manifest.json")
         man_key = keys.join("renders", project, "manifest.json")
         store.put_file(man_path, man_key, content_type="application/json", metadata=owner_meta)
@@ -218,7 +230,7 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     elif ordered or outputs.final_video:
         # Normal finish: merge here (off-GPU) unless the pipeline already produced the film.
         final = Path(outputs.final_video) if outputs.final_video else \
-            assemble(ordered, workdir / "full.mp4", audio=outputs.audio).output_path
+            assemble(ordered, workdir / "full.mp4", audio=audio_path).output_path
         from ..assemble import probe_duration, probe_has_audio
         result.output_key = store.put_file(final, keys.output_key(project),
                                            content_type="video/mp4", metadata=owner_meta)

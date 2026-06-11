@@ -145,3 +145,13 @@ def test_assemble_muxes_audio_track(tmp_path):
     res = assemble([ClipInput("shot_01", a)], tmp_path / "final.mp4", audio=audio)
     assert res.has_audio is True
     assert res.seconds == pytest.approx(2.0, abs=0.3)
+
+
+def test_concat_cmd_pads_and_trims_audio_to_video_length():
+    cmd = ffmpeg_concat_cmd(Path("list.txt"), Path("out.mp4"), audio=Path("bed.m4a"))
+    # video length wins: apad pads a short bed, -shortest trims a long one
+    assert "-af" in cmd and "apad" in cmd and "-shortest" in cmd
+    assert cmd[cmd.index("-af") + 1] == "apad"
+    # no audio -> no apad / -shortest
+    plain = ffmpeg_concat_cmd(Path("list.txt"), Path("out.mp4"))
+    assert "apad" not in plain and "-shortest" not in plain

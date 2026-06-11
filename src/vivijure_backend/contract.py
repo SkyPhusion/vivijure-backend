@@ -206,6 +206,9 @@ class RenderRequest:
     overrides: dict[str, Any] = field(default_factory=dict)  # raw render_overrides; routing flags only
     pretrained_loras: dict[str, str] = field(default_factory=dict)
     process_shot_ids: list[str] | None = None  # finalize / regen subset
+    # Optional audio bed: an R2 key the control plane staged (e.g. audio/<uuid>.m4a). The harness
+    # fetches it and muxes it under the final video; None leaves the render silent.
+    audio_key: str | None = None
     # The Access-authenticated user who submitted the job. Stamped as customMetadata.user_email on
     # every uploaded artifact so the control plane's ownership-gated /api/artifact route can serve
     # them back; None for a local/test run leaves uploads untagged.
@@ -226,6 +229,7 @@ class RenderRequest:
             overrides=overrides,
             pretrained_loras=d.get("pretrained_loras") if isinstance(d.get("pretrained_loras"), dict) else {},
             process_shot_ids=d.get("process_shot_ids") if isinstance(d.get("process_shot_ids"), list) else None,
+            audio_key=_str(d.get("audio_key")) or None,
             user_email=ue.strip() if isinstance(ue, str) and ue.strip() else None,
         )
 
