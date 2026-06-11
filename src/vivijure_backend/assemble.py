@@ -113,13 +113,17 @@ def ffmpeg_concat_cmd(list_file: Path, out_path: Path, *,
                       reencode: bool = False, audio: Path | None = None) -> list[str]:
     """argv for concatenating the playlist into `out_path`. Stream-copies the video by default
     (the i2v clips share a codec); re-encodes only when asked. An audio track is mixed in as a
-    second input, AAC-encoded, and `-shortest` keeps the mux to the length of the picture."""
+    second input, AAC-encoded, padded with `apad` and trimmed with `-shortest` so the output is
+    exactly the picture length (a short bed gets trailing silence; a long one is trimmed)."""
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file)]
     if audio is not None:
         cmd += ["-i", str(audio)]
     cmd += _REENCODE_VIDEO if reencode else ["-c:v", "copy"]
     if audio is not None:
-        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest"]
+        # Video length wins: `apad` pads a short bed with trailing silence and `-shortest` then
+        # trims the (now >= video) audio to the picture, so the film is never cut short by a
+        # shorter track nor extended past its last frame by a longer one.
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-af", "apad", "-shortest"]
     cmd.append(str(out_path))
     return cmd
 
