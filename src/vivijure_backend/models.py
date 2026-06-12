@@ -321,6 +321,66 @@ class ModelServer:
         self._cache["i2v"] = pipe
         return pipe
 
+    def frame_interpolator(self):
+        """RIFE recursive-2x frame interpolator for the finishing stage. Loads the flownet weights
+        named by the FRAME_INTERP spec once and caches them; the returned object exposes
+        `interpolate(frame_a, frame_b) -> midpoint_frame` over HxWx3 uint8 arrays, which
+        `finish._interpolate_once` calls to insert a frame between every adjacent pair.
+
+        Deferred heavy imports (torch + the RIFE inference module) keep this module CPU-importable;
+        the body is validated on a pod. A load failure RAISES (it does not return None): the finish
+        stage decides whether a configured-but-unloadable pass is fatal, so the failure must not be
+        swallowed here into a silent no-op. The render that asked for smooth motion gets a loud
+        error, not a clip that quietly shipped at 16 fps."""
+        if "frame_interp" in self._cache:
+            return self._cache["frame_interp"]
+        import os
+
+        spec = self.specs[ModelRole.FRAME_INTERP]
+        weight_path = os.path.join(
+            os.environ.get("VJ_MODELS_ROOT", "/opt/models"),
+            spec.repo_id.split("/")[-1], spec.weight_name or "flownet.pkl")
+        interp = _RifeInterpolator(weight_path)
+        self._cache["frame_interp"] = interp
+        return interp
+
+    def face_restorer(self, backend=None):
+        """Blind face restorer for the finishing stage (relock identity over the i2v frames). The
+        returned object exposes `restore(frame, fidelity=, only_faces=)` over an HxWx3 uint8 frame;
+        the per-backend argument mapping (GFPGAN `weight` vs CodeFormer `w`) and the paste-back wiring
+        live in the wrapper so `finish` stays backend-agnostic.
+
+        `backend` is a `config.FaceRestore` member (or its string value); when None it falls back to
+        the FACE_RESTORE spec's default (GFPGAN). `FaceRestore.NONE` is a programming error here (the
+        finish stage only calls this when face restore is ON), so it RAISES rather than returning a
+        no-op. As with `frame_interpolator`, a load failure RAISES so a configured pass that cannot
+        load fails loud rather than silently skipping the restore.
+
+        Deferred heavy imports (torch + the restorer + facelib detection) keep this module
+        CPU-importable; the body is validated on a pod."""
+        from .config import FaceRestore  # deferred: config imports models, so break the cycle here
+
+        choice = FaceRestore(str(backend.value if isinstance(backend, FaceRestore) else backend).lower()) \
+            if backend is not None else FaceRestore.GFPGAN
+        if choice is FaceRestore.NONE:
+            raise ValueError("face_restorer() called with FaceRestore.NONE; finish should not restore")
+
+        cache_key = f"face_restore:{choice.value}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        import os
+
+        spec = self.specs[ModelRole.FACE_RESTORE]
+        models_root = os.environ.get("VJ_MODELS_ROOT", "/opt/models")
+        if choice is FaceRestore.CODEFORMER:
+            restorer = _CodeFormerRestorer(models_root)
+        else:
+            weight_path = os.path.join(
+                models_root, spec.repo_id.split("/")[-1], spec.weight_name or "GFPGANv1.4.pth")
+            restorer = _GfpganRestorer(weight_path)
+        self._cache[cache_key] = restorer
+        return restorer
+
     def unload(self) -> None:
         self._cache.clear()
         try:
@@ -348,3 +408,112 @@ def _set_attention(pipe, device: Device) -> None:
             pipe.set_attention_backend("flash_attention_3")  # diffusers attention dispatch
         except Exception:
             pass  # fall through to the pipeline default (SDPA)
+
+
+# --------------------------------------------------------------------------- finish-stage models
+#
+# These three wrappers are the GPU bodies of the finishing stage's two passes. They are constructed
+# by `ModelServer.frame_interpolator` / `face_restorer` (so the load runs once and is cached) and
+# expose a uniform, backend-agnostic interface that `finish.py` drives: the RIFE interpolator yields
+# a midpoint frame for a pair, and either face restorer takes one frame and returns the restored
+# frame. The per-backend argument names (GFPGAN `weight` vs CodeFormer `w`) and the only-faces
+# paste-back wiring live HERE, so `finish` never has to know which restorer it got. All heavy imports
+# (torch / the RIFE module / GFPGAN / CodeFormer / facelib) are deferred into the constructors, so
+# this module stays CPU-importable; the bodies are validated on a pod.
+
+class _RifeInterpolator:
+    """RIFE recursive-2x interpolator. `interpolate(a, b)` returns the synthesized midpoint frame
+    for the adjacent pair `(a, b)` (HxWx3 uint8 in, same out). The model loads once in __init__."""
+
+    def __init__(self, weight_path: str):
+        import torch  # deferred
+        from rife.RIFE_HDv3 import Model  # Practical-RIFE inference module (MIT weights)
+
+        self._torch = torch
+        self._model = Model()
+        self._model.load_model(weight_path, -1)
+        self._model.eval()
+        self._model.device()
+
+    def interpolate(self, frame_a, frame_b):
+        torch = self._torch
+        a = torch.from_numpy(frame_a).permute(2, 0, 1).float().div(255.0).unsqueeze(0).cuda()
+        b = torch.from_numpy(frame_b).permute(2, 0, 1).float().div(255.0).unsqueeze(0).cuda()
+        with torch.no_grad():
+            mid = self._model.inference(a, b)
+        out = (mid[0].clamp(0, 1) * 255.0).byte().permute(1, 2, 0).cpu().numpy()
+        return out
+
+
+class _GfpganRestorer:
+    """GFPGAN blind face restorer. `restore(frame, fidelity, only_faces)` runs the restorer over the
+    detected faces in one frame. GFPGAN's fidelity knob is `weight` (its restoration/fidelity
+    balance), and `paste_back` controls whether the restored faces are composited back into the full
+    frame: with `only_faces` False we paste the restored faces back over the whole frame; with
+    `only_faces` True we still paste them back (the restored faces are what we want), but leave the
+    rest of the frame untouched, which is GFPGAN's default paste behavior. The model loads once."""
+
+    def __init__(self, weight_path: str):
+        from gfpgan import GFPGANer  # deferred
+
+        self._restorer = GFPGANer(model_path=weight_path, upscale=1, arch="clean",
+                                  channel_multiplier=2, bg_upsampler=None)
+
+    def restore(self, frame, *, fidelity: float = 0.7, only_faces: bool = True):
+        # paste_back composites the restored faces back into the frame. We always want the restored
+        # faces, so paste_back is True; `only_faces` means "do not also touch the background", and
+        # GFPGAN with bg_upsampler=None already leaves the non-face background as-is, so the flag is
+        # honored by NOT enabling a background upsampler rather than by suppressing the paste.
+        _cropped, _restored, restored_img = self._restorer.enhance(
+            frame, has_aligned=False, only_center_face=False,
+            paste_back=True, weight=float(fidelity))
+        return restored_img if restored_img is not None else frame
+
+
+class _CodeFormerRestorer:
+    """CodeFormer blind face restorer (S-Lab NON-COMMERCIAL: a deploy-time opt-in, never bundled).
+    `restore(frame, fidelity, only_faces)` mirrors `_GfpganRestorer` but maps fidelity to
+    CodeFormer's own argument name `w` (its fidelity weight: higher keeps more of the input
+    identity). Loads the net + a FaceRestoreHelper once."""
+
+    def __init__(self, models_root: str):
+        import os
+
+        import torch  # deferred
+        from basicsr.utils.registry import ARCH_REGISTRY
+        from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+
+        self._torch = torch
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        net = ARCH_REGISTRY.get("CodeFormer")(
+            dim_embd=512, codebook_size=1024, n_head=8, n_layers=9,
+            connect_list=["32", "64", "128", "256"]).to(self._device)
+        ckpt = os.path.join(models_root, "CodeFormer", "codeformer.pth")
+        net.load_state_dict(torch.load(ckpt, map_location=self._device)["params_ema"])
+        net.eval()
+        self._net = net
+        self._helper = FaceRestoreHelper(
+            upscale_factor=1, face_size=512, device=self._device)
+
+    def restore(self, frame, *, fidelity: float = 0.7, only_faces: bool = True):
+        torch = self._torch
+        from torchvision.transforms.functional import normalize
+        from basicsr.utils import img2tensor, tensor2img
+
+        helper = self._helper
+        helper.clean_all()
+        helper.read_image(frame)
+        helper.get_face_landmarks_5(only_center_face=False)
+        helper.align_warp_face()
+        for cropped in helper.cropped_faces:
+            t = img2tensor(cropped / 255.0, bgr2rgb=True, float32=True)
+            normalize(t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+            t = t.unsqueeze(0).to(self._device)
+            with torch.no_grad():
+                out = self._net(t, w=float(fidelity), adain=True)[0]  # CodeFormer fidelity arg is `w`
+            helper.add_restored_face(tensor2img(out, rgb2bgr=True, min_max=(-1, 1)).astype("uint8"))
+        helper.get_inverse_affine(None)
+        # paste_back True: composite the restored faces back over the frame. only_faces leaves the
+        # rest of the frame as-is (no background upsampler is passed), so the flag is honored.
+        restored = helper.paste_faces_to_input_image(upsample_img=None)
+        return restored if restored is not None else frame

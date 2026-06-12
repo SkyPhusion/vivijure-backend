@@ -92,6 +92,15 @@ class ProgressEmitter:
             self.emit("i2v_step", shot=shot, step=int(step), total=int(total))
         return cb
 
+    def finish_cb(self, shot: str) -> Callable[[str, int, int], None]:
+        """A per-clip finishing-stage callback for `finish.finish_clip` to call. `stage` is the
+        sub-pass ('face_restore' / 'interpolate'); `done`/`total` tick within that pass, so the
+        snapshot shows which finish pass a clip is in (the interpolation pass especially can be the
+        long pole when an i2v clip has many frames)."""
+        def cb(stage: str, done: int, total: int) -> None:
+            self.emit("finish_step", shot=shot, stage=str(stage), done=int(done), total=int(total))
+        return cb
+
     # --- internals (every one best-effort) ---
 
     def _update_snapshot(self, rec: dict) -> None:
@@ -149,6 +158,7 @@ class NullEmitter:
     def error(self, *a, **k) -> None: pass
     def train_step_cb(self, slot: str): return None
     def i2v_step_cb(self, shot: str): return None
+    def finish_cb(self, shot: str): return None
 
 
 def read_snapshot(store, project: str, job_id: str) -> dict | None:

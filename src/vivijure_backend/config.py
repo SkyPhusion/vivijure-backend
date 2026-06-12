@@ -372,11 +372,18 @@ class FinishConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None, *, tier: QualityTier | None = None) -> "FinishConfig":
+        # RIFE interpolates by recursive doubling, so the only valid factors are powers of two
+        # (1/2/4/8). A plain [1,8] clamp would let 3/5/6/7 through and `finish` then silently rounds
+        # them DOWN at render time, so the stored config would not match what actually runs. Snap
+        # here, at config validation, so the typed config is the truth: factor 3 -> 2, 6 -> 4, etc.
+        from .finish import snap_factor  # deferred: keeps finish CPU-light and avoids any cycle
+
         base = cls.for_tier(tier) if tier is not None else cls()
         d = d if isinstance(d, dict) else {}
         return cls(
             interpolate=bool(d.get("interpolate", base.interpolate)),
-            interpolation_factor=_clamp_int(d.get("interpolation_factor"), 1, 8, base.interpolation_factor),
+            interpolation_factor=snap_factor(
+                _clamp_int(d.get("interpolation_factor"), 1, 8, base.interpolation_factor)),
             target_fps=_clamp_int(d.get("target_fps"), 0, 120, base.target_fps),
             face_restore=_enum_or(FaceRestore, d.get("face_restore"), base.face_restore),
             face_fidelity=_clamp(d.get("face_fidelity"), 0.0, 1.0, base.face_fidelity),
