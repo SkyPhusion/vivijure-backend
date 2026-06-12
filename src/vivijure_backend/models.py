@@ -297,13 +297,10 @@ class ModelServer:
         # quantize the plain fused model. The few-step distill is the draft/standard speed path; a
         # final-tier worker sets VJ_I2V_DISTILL=0 to keep full steps.
         if os.environ.get("VJ_I2V_DISTILL", "1") != "0":
-            distill = self.specs[ModelRole.I2V_DISTILL]
-            try:
-                pipe.load_lora_weights(distill.repo_id, adapter_name="distill")
-                pipe.fuse_lora()
-                pipe.unload_lora_weights()
-            except Exception as e:  # noqa: BLE001
-                print(f"i2v distill LoRA load/fuse failed ({e}); full-step. Fallback: LightX2V loader.")
+            _load_i2v_distill(pipe, self.specs[ModelRole.I2V_DISTILL])
+        else:
+            pipe._vj_i2v_distill_loaded = False
+            pipe._vj_i2v_distill_fused = False
 
         use_fp8 = (self.device.supports_fp8 and not offload
                    and os.environ.get("VJ_I2V_FP8", "1") != "0")
@@ -420,6 +417,140 @@ def _set_attention(pipe, device: Device) -> None:
 # paste-back wiring live HERE, so `finish` never has to know which restorer it got. All heavy imports
 # (torch / the RIFE module / GFPGAN / CodeFormer / facelib) are deferred into the constructors, so
 # this module stays CPU-importable; the bodies are validated on a pod.
+
+
+# --------------------------------------------------------------------------- i2v distill loaders
+
+
+def _load_i2v_distill(pipe, distill_spec) -> None:
+    """Load the Wan2.2-Lightning distill LoRA onto `pipe`, trying the diffusers path first
+    (fuse-before-fp8) then the LightX2V/manual path (direct weight delta, survives fp8 quant).
+
+    Records the outcome on the pipe:
+    - `_vj_i2v_distill_loaded` (bool): True when ANY loader succeeded.
+    - `_vj_i2v_distill_fused` (bool): True when the diffusers fuse path baked the LoRA into
+      the base weights (cannot be toggled off; the model IS distilled for its lifetime).
+
+    Never raises: a load failure leaves both flags False and i2v.py runs full-step instead
+    (and will refuse a 4-step-no-distill request via _set_distill)."""
+    pipe._vj_i2v_distill_loaded = False
+    pipe._vj_i2v_distill_fused = False
+
+    if _try_diffusers_distill(pipe, distill_spec):
+        return
+    if _try_lightx2v_distill(pipe, distill_spec):
+        return
+    print(f"i2v: all distill loaders failed for {distill_spec.repo_id}; full-step only. "
+          "Set VJ_I2V_DISTILL=0 to suppress this warning.", flush=True)
+
+
+def _try_diffusers_distill(pipe, distill_spec) -> bool:
+    """Load and fuse the distill LoRA via diffusers before fp8 quantization.
+
+    Fusing bakes the LoRA delta permanently into the base weights so the quantizer sees plain
+    weight matrices (TorchaoLoraLinear cannot be quantized after a LoRA is attached, #12535).
+    Returns True on success and marks the pipe as fused."""
+    try:
+        pipe.load_lora_weights(distill_spec.repo_id, adapter_name="distill")
+        pipe.fuse_lora()
+        pipe.unload_lora_weights()
+        pipe._vj_i2v_distill_loaded = True
+        pipe._vj_i2v_distill_fused = True
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"i2v distill (diffusers): {distill_spec.repo_id} failed ({e!r}); "
+              "trying LightX2V fallback.", flush=True)
+        return False
+
+
+def _try_lightx2v_distill(pipe, distill_spec) -> bool:
+    """LightX2V fallback: apply the LoRA delta directly to the transformer weight matrices.
+
+    Bypasses diffusers' adapter injection entirely -- works on fp8-quantized
+    TorchaoLoraLinear layers where diffusers load_lora_weights raises (#12535).
+
+    Pod-validate items (marked POD-TODO):
+    - Actual filename in the lightx2v/Wan2.2-Lightning HF repo.
+    - Whether `lightx2v` package is installed in the image and the correct import path.
+    - LoRA key prefix format (transformer.* vs diffusion_model.*).
+    - Alpha key naming convention.
+
+    Returns True on success (sets distill_loaded=True, distill_fused=False so the caller
+    can toggle the adapter weight if the pipe later supports it), False on any error."""
+    try:
+        return _apply_lora_delta_to_wan(pipe, distill_spec)
+    except Exception as e:  # noqa: BLE001
+        print(f"i2v distill (LightX2V/manual): failed ({e!r})", flush=True)
+        return False
+
+
+def _apply_lora_delta_to_wan(pipe, distill_spec) -> bool:
+    """Apply the Wan2.2-Lightning LoRA as a weight delta (B @ A * alpha/rank) directly onto each
+    transformer expert's weight matrices. No diffusers LoRA injection -- works on quantized models.
+
+    POD-TODO: verify the filename and key format against the actual repo. The Wan2.2-Lightning
+    safetensors from lightx2v/Wan2.2-Lightning uses keys structured as either:
+    "transformer.<block>.<proj>.lora_A.weight" or "diffusion_model.<...>.lora_A.weight".
+    Confirm the correct prefix and alpha key name on the pod before shipping as the default."""
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    # POD-TODO: verify the actual filename in lightx2v/Wan2.2-Lightning
+    lora_path = hf_hub_download(distill_spec.repo_id,
+                                 filename="wan2.2_i2v_lora.safetensors")  # POD-TODO: confirm filename
+    sd = load_file(lora_path)
+
+    applied = 0
+    for key, val in sd.items():
+        if ".lora_A." not in key:
+            continue
+        b_key = key.replace(".lora_A.", ".lora_B.")
+        if b_key not in sd:
+            continue
+        lora_a, lora_b = val, sd[b_key]   # A: (rank, in_feat), B: (out_feat, rank)
+        rank = lora_a.shape[0]
+        alpha_key = key.rsplit(".lora_A.", 1)[0] + ".alpha"
+        alpha = float(sd[alpha_key]) if alpha_key in sd else float(rank)
+        scale = alpha / rank
+
+        for expert_attr in ("transformer", "transformer_2"):
+            expert = getattr(pipe, expert_attr, None)
+            if expert is None:
+                continue
+            # Strip the expert prefix + optional "diffusion_model." wrapper -- POD-TODO: confirm
+            mod_key = key.split(".lora_A.")[0]
+            for pfx in (f"{expert_attr}.", "diffusion_model."):
+                if mod_key.startswith(pfx):
+                    mod_key = mod_key[len(pfx):]
+                    break
+            try:
+                mod = _nested_module(expert, mod_key)
+                delta = (lora_b.to(torch.float32) @ lora_a.to(torch.float32)) * scale
+                mod.weight.data += delta.to(mod.weight.dtype)
+                applied += 1
+            except (AttributeError, RuntimeError):
+                continue
+
+    if applied == 0:
+        first3 = list(sd.keys())[:3]
+        raise RuntimeError(
+            f"No LoRA weights applied from {distill_spec.repo_id} -- key format mismatch. "
+            f"First 3 sd keys: {first3}. POD-TODO: verify key prefix.")
+    print(f"i2v distill (manual delta): applied {applied} LoRA pairs from {distill_spec.repo_id}",
+          flush=True)
+    pipe._vj_i2v_distill_loaded = True
+    pipe._vj_i2v_distill_fused = False
+    return True
+
+
+def _nested_module(root, dotted_key: str):
+    """Traverse a dotted module path (e.g. 'blocks.3.attn.to_q') on `root`."""
+    mod = root
+    for part in dotted_key.split("."):
+        mod = getattr(mod, part)
+    return mod
+
 
 class _RifeInterpolator:
     """RIFE recursive-2x interpolator. `interpolate(a, b)` returns the synthesized midpoint frame
