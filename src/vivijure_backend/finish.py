@@ -94,6 +94,7 @@ class FinishParams:
     factor: int = 2                 # 2 / 4 / 8; recursive RIFE doubling (snapped to a power of two)
     target_fps: int = 0             # 0 = src*factor; else a hard cap on the realized fps
     face_restore: bool = False
+    face_restore_backend: str = "gfpgan"  # which restorer when face_restore is on (gfpgan / codeformer)
     face_fidelity: float = 0.7      # restorer balance: 0 = max restoration, 1 = max fidelity to input
     only_faces: bool = True         # restore detected faces only, leave the rest of the frame untouched
 
@@ -127,24 +128,32 @@ def finish_clip(
     params: FinishParams | None = None,
     progress_cb=None,
 ) -> FinishResult:
-    """Finish one animated clip: decode -> (face restore) -> (interpolate) -> re-encode.
+    """Finish one animated clip: decode -> (face restore) -> (interpolate) -> uniform re-encode.
 
     `server` is a `models.ModelServer` (provides the cached RIFE interpolator and face restorer).
     Heavy imports (torch / imageio / the restorer) are deferred so this module stays CPU-importable;
-    the body is validated on a pod. Each pass is best-effort: if its model cannot load, that pass is
-    skipped (the clip still passes through) rather than failing the whole render, matching the rest of
-    the GPU layer. `progress_cb(stage, done, total)` is optional and best-effort.
+    the body is validated on a pod. `progress_cb(stage, done, total)` is optional and best-effort.
+
+    Load-failure policy: a CONFIGURED pass whose model cannot load FAILS the render loud, it is not
+    silently downgraded to a no-op. The whole point of this stage is the quality lift; a job that
+    asked for smooth motion or a relocked face and got neither, with no error, is the worst outcome.
+    (Per-FRAME hiccups inside a pass stay best-effort -- see `_restore_frame` -- so one bad frame
+    does not sink a clip; but a missing MODEL is a deploy error worth surfacing.)
 
     Face restoration runs BEFORE interpolation deliberately: restore the real, model-generated frames
     (where the face detail lives), then let interpolation synthesize the in-between frames from
     already-cleaned anchors, so it never amplifies a restoration artifact across the inserted frames.
+
+    Every clip is re-encoded to a uniform (codec, pix_fmt, fps) regardless of which passes ran, so
+    the off-GPU `assemble` stream-copy concat stays valid across the whole render: a 1-frame or
+    interpolation-skipped clip is encoded the SAME way as a fully interpolated one, so they never
+    disagree on parameters and force the slow re-encode fallback.
     """
     cfg = params or FinishParams()
     in_path, out_path = Path(in_path), Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     import imageio.v3 as iio  # deferred: keep this module CPU-importable
-    from diffusers.utils import export_to_video
 
     meta = iio.immeta(in_path, plugin="pyav")
     src_fps = int(round(meta.get("fps", 16))) or 16
@@ -153,24 +162,24 @@ def finish_clip(
 
     face_restored = False
     if cfg.face_restore and frames:
-        restorer = _safe(lambda: server.face_restorer(), "face restorer")
-        if restorer is not None:
-            frames = [_restore_frame(restorer, f, cfg) for f in frames]
-            face_restored = True
-            _tick(progress_cb, "face_restore", frames_in, frames_in)
+        # A configured restorer that cannot load is fatal (no `_safe` swallow): the loader RAISES and
+        # we let it propagate. Restore the whole clip through ONE restorer instance for a stable
+        # identity (see `_restore_clip`); per-frame independent restoration causes identity flicker.
+        restorer = server.face_restorer(cfg.face_restore_backend)
+        frames = _restore_clip(restorer, frames, cfg, progress_cb)
+        face_restored = True
 
     interpolated = False
     if cfg.interpolate and len(frames) > 1:
-        interp = _safe(lambda: server.frame_interpolator(), "frame interpolator")
-        if interp is not None:
-            passes = interpolation_passes(cfg.factor)
-            for p in range(passes):
-                frames = _interpolate_once(interp, frames)
-                _tick(progress_cb, "interpolate", p + 1, passes)
-            interpolated = passes > 0
+        interp = server.frame_interpolator()  # configured-but-unloadable -> raises, not a silent skip
+        passes = interpolation_passes(cfg.factor)
+        for p in range(passes):
+            frames = _interpolate_once(interp, frames)
+            _tick(progress_cb, "interpolate", p + 1, passes)
+        interpolated = passes > 0
 
     out_fps = output_fps(src_fps, cfg) if interpolated else src_fps
-    export_to_video([_as_image(f) for f in frames], str(out_path), fps=out_fps)
+    _encode_uniform(frames, out_path, out_fps)
     return FinishResult(
         shot_id=shot_id, path=out_path, src_fps=src_fps, out_fps=out_fps,
         frames_in=frames_in, frames_out=len(frames),
@@ -191,30 +200,46 @@ def _interpolate_once(interp, frames):
     return out
 
 
+def _restore_clip(restorer, frames, cfg: FinishParams, progress_cb=None):
+    """Face-restore a whole clip through ONE restorer instance, in clip order. Restoring every frame
+    with the SAME loaded model (rather than re-loading or re-detecting per call) keeps the relocked
+    identity consistent across the clip, which is what avoids the frame-to-frame identity flicker a
+    naive per-frame restore produces. Per-frame errors stay best-effort (one bad frame passes
+    through untouched) so a single detector miss does not drop the clip."""
+    n = len(frames)
+    out = []
+    for i, f in enumerate(frames):
+        out.append(_restore_frame(restorer, f, cfg))
+        _tick(progress_cb, "face_restore", i + 1, n)
+    return out
+
+
 def _restore_frame(restorer, frame, cfg: FinishParams):
     """Run the blind face restorer over one frame's detected faces. Best-effort per frame: a frame
-    the restorer chokes on passes through untouched rather than dropping the clip."""
+    the restorer chokes on passes through untouched rather than dropping the clip.
+
+    The fidelity-to-backend-argument mapping (GFPGAN `weight` vs CodeFormer `w`) and the paste-back
+    wiring live in the restorer wrapper (models.py), so this passes the uniform knobs only:
+    `fidelity` and `only_faces`. `only_faces` is now LIVE -- the old `paste_back=not only_faces or
+    True` was always True, making the flag dead; the wrapper honors it."""
     try:
-        return restorer.restore(frame, fidelity=cfg.face_fidelity, only_center_face=False,
-                                paste_back=not cfg.only_faces or True)
+        return restorer.restore(frame, fidelity=cfg.face_fidelity, only_faces=cfg.only_faces)
     except Exception:  # noqa: BLE001
         return frame
 
 
-def _as_image(frame):
-    """export_to_video wants PIL images or HxWx3 arrays; pass arrays straight through, wrap anything
-    else defensively. Kept tiny so the encode path is obvious."""
-    return frame
+def _encode_uniform(frames, out_path: Path, fps: int) -> None:
+    """Encode `frames` to `out_path` at a fixed (codec, pix_fmt, fps) so every finished clip in a
+    render shares the same parameters and the downstream stream-copy concat in `assemble` stays
+    valid (no per-clip re-encode fallback). H.264 / yuv420p is the broadly playable baseline the
+    re-encode path in `assemble` also targets, so a finished clip and an assembler re-encode agree.
+    Deferred imports keep this module CPU-importable."""
+    import imageio.v3 as iio  # deferred
 
-
-def _safe(thunk, what: str):
-    """Load a finish model, returning None (and logging) if it cannot -- so a missing/finicky finish
-    model degrades that pass to a no-op instead of failing the render."""
-    try:
-        return thunk()
-    except Exception as e:  # noqa: BLE001
-        print(f"finish: {what} unavailable ({e}); skipping that pass.", flush=True)
-        return None
+    iio.imwrite(
+        str(out_path), list(frames), plugin="pyav", fps=max(1, int(fps)),
+        codec="libx264", out_pixel_format="yuv420p",
+    )
 
 
 def _tick(progress_cb, stage: str, done: int, total: int) -> None:
