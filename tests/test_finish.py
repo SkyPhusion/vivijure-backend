@@ -268,22 +268,60 @@ class _FakeServer:
         return self._restorer
 
 
+_MISSING = object()
+
+
 class _patched_modules:
-    """Context manager that installs fake modules into sys.modules and restores them after, so a
-    deferred `import imageio.v3` (and friends) resolves to a CPU fake during the test."""
+    """Install fake modules into sys.modules within the block; restore on exit.
+
+    For dotted names (e.g. 'imageio.v3'), also pre-stubs any absent ancestor packages with bare
+    ModuleTypes AND wires the fake as an attribute on the parent. Both steps are required because
+    `import a.b as x` compiles to IMPORT_NAME + IMPORT_FROM: IMPORT_NAME calls __import__ which,
+    when fromlist is None, returns the ROOT module `a` (importing it if absent, which would run
+    `a/__init__.py` against our fake and fail); IMPORT_FROM then resolves `x = getattr(a, 'b')`.
+    Pre-stubbing `a` prevents __init__ from running; wiring `a.b = fake` makes IMPORT_FROM work."""
+
     def __init__(self, mapping):
-        self.mapping = mapping
-        self.saved = {}
+        self.mapping = dict(mapping)
+        self._saved_sys = {}
+        self._saved_attrs = {}  # (parent_name, attr) -> prior attribute value
 
     def __enter__(self):
+        # Pre-stub absent ancestor packages so __import__ never runs their real __init__.
+        for name in list(self.mapping):
+            parts = name.split(".")
+            for depth in range(1, len(parts)):
+                ancestor = ".".join(parts[:depth])
+                if ancestor not in sys.modules and ancestor not in self.mapping:
+                    self._saved_sys[ancestor] = _MISSING
+                    sys.modules[ancestor] = types.ModuleType(ancestor)
+
+        # Install each patch and mirror it as an attribute on the parent stub/module so that
+        # the IMPORT_FROM bytecode (getattr(parent, attr)) resolves to the fake.
         for name, mod in self.mapping.items():
-            self.saved[name] = sys.modules.get(name)
+            self._saved_sys.setdefault(name, sys.modules.get(name, _MISSING))
             sys.modules[name] = mod
+            if "." in name:
+                parent_name, attr = name.rsplit(".", 1)
+                parent = sys.modules.get(parent_name)
+                if parent is not None:
+                    self._saved_attrs[(parent_name, attr)] = getattr(parent, attr, _MISSING)
+                    setattr(parent, attr, mod)
         return self
 
     def __exit__(self, *a):
-        for name, prev in self.saved.items():
-            if prev is None:
+        for (parent_name, attr), prev in self._saved_attrs.items():
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                if prev is _MISSING:
+                    try:
+                        delattr(parent, attr)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(parent, attr, prev)
+        for name, prev in self._saved_sys.items():
+            if prev is _MISSING:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = prev
