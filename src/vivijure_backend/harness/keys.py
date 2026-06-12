@@ -31,17 +31,17 @@ def state_key(project: str) -> str:
 
 def lora_key(project: str, slot: str) -> str:
     """A trained character adapter, by slot."""
-    return f"loras/{_slug(project)}/{slot}/pytorch_lora_weights.safetensors"
+    return f"loras/{_slug(project)}/{_slug(slot)}/pytorch_lora_weights.safetensors"
 
 
 def keyframe_key(project: str, shot_id: str) -> str:
     """A rendered SDXL keyframe, by shot."""
-    return f"renders/{_slug(project)}/keyframes/{shot_id}.png"
+    return f"renders/{_slug(project)}/keyframes/{_slug(shot_id)}.png"
 
 
 def clip_key(project: str, shot_id: str) -> str:
     """A per-shot i2v clip, by shot (the offloaded/per-shot finish emits these)."""
-    return f"renders/{_slug(project)}/clips/{shot_id}.mp4"
+    return f"renders/{_slug(project)}/clips/{_slug(shot_id)}.mp4"
 
 
 def progress_log_key(project: str, job_id: str) -> str:

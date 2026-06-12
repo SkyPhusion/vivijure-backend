@@ -5,6 +5,7 @@ import tarfile
 import pytest
 
 from vivijure_backend.contract import (
+    _safe_extract,
     Bundle,
     Cast,
     RenderRequest,
@@ -201,8 +202,60 @@ def test_bundle_rejects_path_traversal(tmp_path):
         Bundle.extract(tar, tmp_path / "out")
 
 
+
+
+def test_bundle_rejects_symlink(tmp_path):
+    """Symlinks must be rejected even when the stored name is safe."""
+    tar = tmp_path / "bundle.tar.gz"
+    with tarfile.open(tar, "w:gz") as tf:
+        # Add storyboard so extraction doesn't fail on missing storyboard
+        info = tarfile.TarInfo("storyboard.yaml")
+        data = b"{}"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        # Add a symlink member
+        sym = tarfile.TarInfo("link.txt")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "/etc/passwd"
+        tf.addfile(sym)
+    with pytest.raises(ValueError, match="unsafe link"):
+        from vivijure_backend.contract import _safe_extract
+        import tarfile as tf_mod
+        dest = tmp_path / "out"
+        dest.mkdir()
+        with tf_mod.open(tar, "r:gz") as tff:
+            _safe_extract(tff, dest)
+
+
+def test_bundle_rejects_sibling_prefix(tmp_path):
+    """Path traversal via sibling-dir prefix (/tmp/proj vs /tmp/projEVIL) must be rejected."""
+    tar = _make_bundle(tmp_path, {"../sibling.txt": b"escape", "storyboard.yaml": b"{}"})
+    with pytest.raises(ValueError, match="unsafe path"):
+        Bundle.extract(tar, tmp_path / "out")
+
 def test_render_request_parses_audio_key():
     req = RenderRequest.from_dict(
         {"action": "render", "project": "p", "bundle_key": "b", "audio_key": "audio/x.m4a"})
     assert req.audio_key == "audio/x.m4a"
     assert RenderRequest.from_dict({"project": "p"}).audio_key is None
+
+
+def test_bundle_rejects_hardlink(tmp_path):
+    """Hardlinks must be rejected alongside symlinks."""
+    tar = tmp_path / "bundle.tar.gz"
+    with tarfile.open(tar, "w:gz") as tf:
+        info = tarfile.TarInfo("storyboard.yaml")
+        data = b"{}"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        lnk = tarfile.TarInfo("hardlink.txt")
+        lnk.type = tarfile.LNKTYPE
+        lnk.linkname = "/etc/passwd"
+        tf.addfile(lnk)
+    with pytest.raises(ValueError, match="unsafe link"):
+        from vivijure_backend.contract import _safe_extract
+        import tarfile as tf_mod
+        dest = tmp_path / "out"
+        dest.mkdir()
+        with tf_mod.open(tar, "r:gz") as tff:
+            _safe_extract(tff, dest)

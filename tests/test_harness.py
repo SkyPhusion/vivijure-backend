@@ -31,6 +31,22 @@ def test_key_slug_is_path_safe():
     assert keys.output_key("neon rain/standoff") == "renders/neon_rain_standoff/full.mp4"
     assert keys.output_key("   ") == "renders/untitled/full.mp4"
 
+def test_key_slug_guards_shot_id():
+    # A shot_id with slashes must not introduce extra segments into the key.
+    # The threat is a raw "/" in the shot_id; _slug converts it to "_", neutralizing it.
+    k = keys.keyframe_key("neon", "../evil")
+    segment = k.split("keyframes/")[1]
+    assert "/" not in segment, f"slash escaped into segment: {k}"
+    assert keys.keyframe_key("neon", "shot 01") == "renders/neon/keyframes/shot_01.png"
+
+
+def test_key_slug_guards_slot():
+    k = keys.lora_key("neon", "../A")
+    # slot segment is between the project slug and the filename; must contain no "/"
+    segment = k.split("neon/")[1].split("/pytorch")[0]
+    assert "/" not in segment, f"slash escaped into slot segment: {k}"
+
+
 
 # --------------------------------------------------------------------- models mirror
 

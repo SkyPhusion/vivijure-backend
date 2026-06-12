@@ -177,11 +177,18 @@ class Bundle:
 
 
 def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
-    """Reject path traversal before extracting an untrusted tar."""
+    """Reject path traversal and symlink/hardlink escapes before extracting an untrusted tar.
+
+    `str.startswith` has a sibling-prefix bug (/tmp/proj matches /tmp/proj-evil); use
+    Path.is_relative_to (Python 3.9+) for a correct parent-dir check. Symlinks and hardlinks
+    are rejected outright: they can escape dest even when the stored name is safe.
+    """
     dest = dest.resolve()
     for member in tf.getmembers():
+        if member.issym() or member.islnk():
+            raise ValueError(f"unsafe link in bundle: {member.name}")
         target = (dest / member.name).resolve()
-        if not str(target).startswith(str(dest)):
+        if not target.is_relative_to(dest):
             raise ValueError(f"unsafe path in bundle: {member.name}")
     tf.extractall(dest)
 

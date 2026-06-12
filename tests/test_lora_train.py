@@ -54,3 +54,35 @@ def test_trained_lora_carries_the_trigger_token():
     tl = TrainedLora(slot="A", path=Path("a.safetensors"), trigger="Vesper",
                      steps=1000, rank=16, ref_count=8, base_repo="x")
     assert tl.trigger == "Vesper"
+
+
+def test_caption_default_template_works():
+    assert caption_for(_char(), "{name}, {prompt}") == "Vesper, teal-haired netrunner"
+
+
+def test_caption_rejects_unknown_placeholder():
+    with pytest.raises(ValueError, match="unsupported placeholders"):
+        caption_for(_char(), "{name}, {evil}")
+
+
+def test_caption_rejects_nested_format_spec():
+    # {name:{prompt.__class__.__mro__}} passes a str.Formatter inspection of field_name
+    # but evaluates the format_spec as an attribute access; str.replace never reaches it.
+    with pytest.raises(ValueError, match="unsupported placeholders"):
+        caption_for(_char(), "{name:{prompt.__class__}}")
+
+
+def test_caption_rejects_attribute_access():
+    with pytest.raises(ValueError, match="unsupported placeholders"):
+        caption_for(_char(), "{name.__class__}, {prompt}")
+
+
+def test_caption_rejects_stray_braces():
+    with pytest.raises(ValueError, match="unsupported placeholders"):
+        caption_for(_char(), "{name}, {0[x]}")
+
+
+def test_caption_allows_plain_text_no_braces():
+    # A template with no placeholders at all is fine (literal caption)
+    result = caption_for(_char(), "a test caption")
+    assert result == "a test caption"

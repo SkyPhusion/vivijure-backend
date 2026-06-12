@@ -74,10 +74,26 @@ def default_base_repo() -> str:
 
 
 def caption_for(char: Character, template: str) -> str:
-    """The training caption for a slot. Falls back to the name alone when the registry has no
-    prompt, and collapses the template's stray punctuation so an empty field never leaks a
-    dangling comma into the caption."""
-    text = template.format(name=char.name or char.slot, prompt=char.prompt or "")
+    """The training caption for a slot.
+
+    Uses simple str.replace substitution (not str.format) so the template cannot carry
+    attribute-access or format_spec payloads like {name:{prompt.__class__.__mro__}}. A
+    template with unrecognised placeholders has them left literal rather than raising (safe
+    default). Falls back to the name alone when the registry has no prompt, and collapses
+    stray punctuation so an empty field never leaks a dangling comma."""
+    if "{" in template or "}" in template:
+        # Reject any remaining braces after substitution to prevent future .format() reuse
+        # and catch templates with unknown placeholders that signal a mis-authored config.
+        filled = template.replace("{name}", char.name or char.slot).replace(
+            "{prompt}", char.prompt or "")
+        remaining_braces = [c for c in filled if c in "{}"]
+        if remaining_braces:
+            raise ValueError(
+                f"caption_template contains unsupported placeholders: {template!r}; "
+                "only {name} and {prompt} are allowed")
+        text = filled
+    else:
+        text = template
     return ", ".join(part.strip() for part in text.split(",") if part.strip())
 
 
