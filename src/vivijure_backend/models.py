@@ -426,12 +426,16 @@ class _RifeInterpolator:
     for the adjacent pair `(a, b)` (HxWx3 uint8 in, same out). The model loads once in __init__."""
 
     def __init__(self, weight_path: str):
+        import os  # deferred
         import torch  # deferred
-        from rife.RIFE_HDv3 import Model  # Practical-RIFE inference module (MIT weights)
+        from rife.RIFE_HDv3 import Model  # vendored ECCV2022-RIFE HDv3 inference module (MIT weights)
 
         self._torch = torch
         self._model = Model()
-        self._model.load_model(weight_path, -1)
+        # RIFE_HDv3.Model.load_model takes the DIRECTORY that holds flownet.pkl (it appends
+        # `/flownet.pkl` itself), not the file path. weight_path is .../rife/flownet.pkl, so pass its
+        # parent. rank=-1 strips the `module.` prefix the DDP-saved flownet.pkl checkpoint carries.
+        self._model.load_model(os.path.dirname(weight_path), -1)
         self._model.eval()
         self._model.device()
 

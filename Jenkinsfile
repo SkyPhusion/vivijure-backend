@@ -84,6 +84,8 @@ pipeline {
             when { expression { return env.WORKER_VERSION?.trim() } }
             steps {
                 // Build context is the repo root so COPY src/... resolves; Dockerfile lives in deploy/.
+                // Import smoke runs AFTER build and BEFORE push: a missing runtime dep (gfpgan,
+                // basicsr, rife, av) fails here in seconds rather than after a 33-min GPU render.
                 sh '''
                     set -eu
                     IMG="${REGISTRY}/${OWNER}/${WORKER_IMAGE}"
@@ -94,6 +96,10 @@ pipeline {
                         -t "${IMG}:${WORKER_VERSION}" \
                         -t "${IMG}:latest" \
                         .
+                    echo "--- finish-stage import smoke (CPU, no GPU / weights required) ---"
+                    docker run --rm "${IMG}:${WORKER_VERSION}" \
+                        conda run --no-capture-output -n vivijure \
+                        python /opt/vivijure/smoke_imports.py
                     docker push "${IMG}:${WORKER_VERSION}"
                     docker push "${IMG}:latest"
                 '''

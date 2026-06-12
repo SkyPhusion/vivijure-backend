@@ -64,9 +64,50 @@ RUN python -m pip install --upgrade pip wheel setuptools \
 COPY deploy/requirements.txt /tmp/requirements.txt
 RUN python -m pip install -r /tmp/requirements.txt
 
+# Compat patches for finishing-stage deps that predate the cu128 / numpy-2.x stack.
+# These are surgical sed passes over the three packages we know are affected; sed -i is a no-op
+# when a future pip release has already fixed the import, so the layer stays reproducible.
+#   (1) basicsr 0.4.2 imports torchvision.transforms.functional_tensor (removed in 0.17).
+#       facexlib and gfpgan occasionally share the same import; patch all three.
+#   (2) basicsr + facexlib use np.bool / np.int / np.float / np.complex aliases (removed in 1.24).
+RUN SITE=$(python -c "import site; print(site.getsitepackages()[0])") \
+    && for pkg in basicsr facexlib gfpgan; do \
+         [ -d "$SITE/$pkg" ] || continue; \
+         find "$SITE/$pkg" -name "*.py" -exec sed -i \
+           -e 's/torchvision\.transforms\.functional_tensor/torchvision.transforms.functional/g' \
+           -e 's/np\.bool\b/bool/g' \
+           -e 's/np\.int\b/int/g' \
+           -e 's/np\.float\b/float/g' \
+           -e 's/np\.complex\b/complex/g' \
+           -e 's/np\.object\b/object/g' \
+           -e 's/np\.str\b/str/g' \
+         {} +; \
+       done
+
+# RIFE (ECCV2022 HDv3 lineage): not on PyPI, and the upstream GitHub repos do NOT ship an
+# importable `rife/` package (Practical-RIFE's tree is demo/ + model/, no rife/RIFE_HDv3.py). We
+# vendor a complete, self-consistent `rife/` package so `from rife.RIFE_HDv3 import Model`
+# (models.py) resolves on PYTHONPATH. Source: the svjack/CogVideoX-5B-Space HF space, whose rife/
+# package is the ECCV2022-RIFE HDv3 code with clean intra-package relative imports
+# (RIFE_HDv3 -> .IFNet_HDv3 / .warplayer / .loss). This is the SAME RIFE_HDv3/IFNet(c=90) lineage
+# as the seeded varnish flownet.pkl (models mirror -> $VJ_MODELS_ROOT/rife/flownet.pkl), so the
+# state_dict loads without a key mismatch (the loader passes rank=-1 to strip the `module.` prefix).
+# No model weights are baked here; only the ~25KB of inference code. Pinned to a HF revision so the
+# layer is reproducible.
+ARG VJ_RIFE_REPO=https://huggingface.co/spaces/svjack/CogVideoX-5B-Space
+ARG VJ_RIFE_REV=main
+RUN mkdir -p /opt/vivijure/rife \
+    && for f in __init__.py RIFE_HDv3.py IFNet_HDv3.py warplayer.py loss.py; do \
+         curl -fsSL "${VJ_RIFE_REPO}/resolve/${VJ_RIFE_REV}/rife/${f}" -o "/opt/vivijure/rife/${f}"; \
+       done \
+    && touch /opt/vivijure/rife/__init__.py
+
 # Our package. src/ layout -> /opt/vivijure/vivijure_backend, on PYTHONPATH.
 WORKDIR /opt/vivijure
 COPY src/vivijure_backend /opt/vivijure/vivijure_backend
+# Import smoke: run inside the image before pushing to catch missing runtime deps in seconds
+# rather than at the end of a 33-min GPU render. See Jenkinsfile stage 'import smoke'.
+COPY deploy/smoke_imports.py /opt/vivijure/smoke_imports.py
 
 # Model + sentinel root the cold-start mirror populates (HF_HOME lives under it).
 RUN mkdir -p /opt/models/hf-cache
