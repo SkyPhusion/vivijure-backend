@@ -204,3 +204,81 @@ def test_run_job_normal_merges_to_output_key(tmp_path):
     assert res["output_key"] == "renders/neon/full.mp4"
     assert res["seconds"] == pytest.approx(2.0, abs=0.4)  # two 1s clips merged
     assert "renders/neon/full.mp4" in store.puts
+
+
+# ---------------------------------------------------------------- incremental reuse
+
+def _make_state_tar(path: Path, slot_markers: list[str], kf_ids: list[str]) -> Path:
+    """Build a minimal state.tar.gz with lora markers and keyframe PNGs."""
+    members: dict[str, bytes] = {
+        "storyboard.yaml": yaml.safe_dump(STORYBOARD).encode(),
+    }
+    for slot in slot_markers:
+        members[f"loras/{slot}/.trained"] = b""
+    for shot_id in kf_ids:
+        members[f"keyframes/{shot_id}.png"] = b"PNG"
+    with tarfile.open(path, "w:gz") as tf:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return path
+
+
+def test_run_job_copies_keyframes_into_bundle_root(tmp_path):
+    """After a render, generated keyframes must appear in bundle.root/keyframes/ so the next
+    incremental render can find them via _restore_prior_state."""
+    store = FakeStore(_bundle_tar(tmp_path / "b.tar.gz"))
+    res = run_job(_job(action="preview"), pipeline=FakePipeline(), store=store,
+                  workdir=tmp_path / "work")
+    # FakePipeline generates keyframes for GENERATE shots; preview generates keyframes, no i2v
+    work = tmp_path / "work" / "project"
+    kf_dir = work / "keyframes"
+    assert kf_dir.is_dir(), "keyframes/ must be written into bundle.root after render"
+    kf_names = {p.stem for p in kf_dir.iterdir() if p.suffix == ".png"}
+    assert "shot_01" in kf_names and "shot_02" in kf_names
+
+
+def test_run_job_writes_lora_markers_into_bundle_root(tmp_path):
+    """After a render, trained LoRA slots must have a .trained marker in bundle.root/loras/."""
+    store = FakeStore(_bundle_tar(tmp_path / "b.tar.gz"))
+    # Use finish_offloaded to skip the ffmpeg merge step (FakePipeline produces dummy MP4 bytes)
+    run_job(_job(render_overrides={"finish_offloaded": True}),
+            pipeline=FakePipeline(), store=store, workdir=tmp_path / "work")
+    work = tmp_path / "work" / "project"
+    for slot in ("A", "B"):
+        marker = work / "loras" / slot / ".trained"
+        assert marker.is_file(), f"lora marker missing for slot {slot}: {marker}"
+
+
+def test_restore_prior_state_derives_sets_from_tar(tmp_path):
+    """_restore_prior_state must extract the state tar and return the right sets."""
+    from vivijure_backend.harness.handler import _restore_prior_state
+
+    state_tar = _make_state_tar(tmp_path / "state.tar.gz",
+                                slot_markers=["A"], kf_ids=["shot_01"])
+
+    class StateFakeStore:
+        def get_file(self, key, dest):
+            shutil.copy(state_tar, dest)
+            return dest
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    trained, existing = _restore_prior_state(StateFakeStore(), "neon", workdir)
+    assert trained == {"A"}
+    assert existing == {"shot_01"}
+
+
+def test_restore_prior_state_returns_empty_on_missing_state(tmp_path):
+    """A project with no prior state (KeyError / fetch failure) returns empty sets."""
+    from vivijure_backend.harness.handler import _restore_prior_state
+
+    class FailingStore:
+        def get_file(self, key, dest):
+            raise FileNotFoundError("no prior state")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    trained, existing = _restore_prior_state(FailingStore(), "fresh-project", workdir)
+    assert trained == set() and existing == set()

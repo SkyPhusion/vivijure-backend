@@ -13,6 +13,8 @@ the per-shot clips plus a manifest for a separate CPU container to merge.
 """
 from __future__ import annotations
 
+import shutil
+import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -185,17 +187,26 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     owner_meta = {"user_email": req.user_email} if req.user_email else None
 
     # LoRA adapters: upload trained ones, pass pretrained through.
+    # Also write a zero-byte marker into the project tree so the next incremental render's
+    # state restore can derive trained_slots without an R2 list call.
     for slot, path in outputs.loras.items():
         key = store.put_file(Path(path), keys.lora_key(project, slot), metadata=owner_meta)
         result.lora[slot] = {"lora_id": key}
+        marker = bundle.root / "loras" / slot / ".trained"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
     for slot, lora_id in req.pretrained_loras.items():
         result.lora.setdefault(slot, {"lora_id": lora_id})
 
-    # Keyframes: upload whatever the stage drew.
+    # Keyframes: upload whatever the stage drew; also persist into the project tree so the
+    # next incremental render's state restore can derive existing_keyframes without an R2 list.
     for shot_id, path in outputs.keyframes.items():
         key = store.put_file(Path(path), keys.keyframe_key(project, shot_id),
                              content_type="image/png", metadata=owner_meta)
         result.keyframes.append(Keyframe(shot_id=shot_id, key=key))
+        state_kf = bundle.root / "keyframes" / f"{shot_id}.png"
+        state_kf.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, state_kf)
 
     # Clips ordered by the storyboard (never the stage's incidental order).
     ordered = order_for_storyboard(
@@ -245,6 +256,43 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     return result
 
 
+def _restore_prior_state(store, project: str, workdir: Path) -> tuple[set[str], set[str]]:
+    """Fetch and extract the prior render's state_key into workdir/project, then derive the sets
+    the planner needs to skip already-done GPU work.
+
+    Returns (trained_slots, existing_keyframes). Both are empty on a fresh project (no prior state)
+    or if the fetch / extraction fails for any reason (best-effort: a stale state is worse than a
+    redundant re-render, but a failed fetch should not abort the job).
+
+    The state tar is extracted into the SAME directory run_job will later use for the bundle
+    (workdir/project). The fresh bundle tar (sent by the control plane) contains storyboard.yaml,
+    characters/, and refs/ -- it does NOT contain keyframes/ or loras/, so extracting the bundle
+    on top of the restored state leaves the prior keyframe PNGs and lora markers intact. The
+    pipeline's _resolve_keyframe checks bundle.root/keyframes/{shot_id}.png, which lands exactly
+    there."""
+    trained_slots: set[str] = set()
+    existing_keyframes: set[str] = set()
+    try:
+        state_tar = workdir / "prior_state.tar.gz"
+        store.get_file(keys.state_key(project), state_tar)
+        state_root = workdir / "project"
+        state_root.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(state_tar, "r:gz") as tf:
+            from ..contract import _safe_extract
+            _safe_extract(tf, state_root)
+        state_tar.unlink(missing_ok=True)
+        loras_dir = state_root / "loras"
+        if loras_dir.is_dir():
+            trained_slots = {d.name for d in loras_dir.iterdir()
+                             if d.is_dir() and (d / ".trained").is_file()}
+        kf_dir = state_root / "keyframes"
+        if kf_dir.is_dir():
+            existing_keyframes = {p.stem for p in kf_dir.iterdir() if p.suffix == ".png"}
+    except Exception:  # noqa: BLE001 -- any fetch/extract failure -> fresh render (safe default)
+        pass
+    return trained_slots, existing_keyframes
+
+
 def handler(job: dict) -> dict:
     """RunPod serverless entry point. Mirrors models on a cold worker, builds the live R2
     client, runs the job through the deployed GPU pipeline, returns the response. RunPod passes
@@ -278,8 +326,10 @@ def handler(job: dict) -> dict:
         raise
 
     workdir = Path(tempfile.mkdtemp(prefix="vj-job-"))
+    trained_slots, existing_keyframes = _restore_prior_state(store, project, workdir)
     return run_job(payload, pipeline=get_pipeline(), store=store, workdir=workdir,
-                   job_id=job_id, mirrored=bool(mirrored), on_progress=on_progress)
+                   job_id=job_id, mirrored=bool(mirrored), on_progress=on_progress,
+                   trained_slots=trained_slots, existing_keyframes=existing_keyframes)
 
 
 def _runpod_progress_hook(job: dict):
