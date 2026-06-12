@@ -262,6 +262,23 @@ def test_snap_frames_to_4k_plus_1():
     assert snap_frames(1) == 1
 
 
+def test_snap_frames_does_not_exceed_ceiling():
+    # snap(256) would round UP to 257; must clamp to 253 (the largest 4k+1 <= 256)
+    result = snap_frames(256)
+    assert result == 253
+    assert (result - 1) % 4 == 0
+
+
+def test_snap_frames_max_frames_param():
+    assert snap_frames(81, max_frames=81) == 81   # exactly at ceiling, already valid
+    # 82 snaps up to 85 > 81; step down: prev = 81 - (81-1)%4 = 81 (valid, 4*20+1)
+    assert snap_frames(82, max_frames=81) == 81
+    assert (81 - 1) % 4 == 0
+    # with max=80: 80 snaps to 81 > 80; step down to 77 (4*19+1)
+    assert snap_frames(80, max_frames=80) == 77
+    assert (77 - 1) % 4 == 0
+
+
 def test_frames_for_target_duration():
     assert frames_for(5, 16) == 81       # 80 -> snapped 81
     assert frames_for(4, 16) == 65       # 64 -> snapped 65
@@ -404,3 +421,20 @@ def test_frames_for_respects_max_frames_parameter():
 def test_frames_for_snaps_to_4k_plus_1_even_with_custom_ceiling():
     n = frames_for(10, 16, max_frames=200)
     assert (n - 1) % 4 == 0, f"{n} is not 4k+1"
+
+
+def test_set_distill_fused_guard_covers_lightx2v_path():
+    """When LightX2V baked the delta (loaded=True, fused=True), _set_distill must early-return
+    regardless of the distill flag, not call set_adapters. This was the bug: LightX2V set
+    fused=False so _set_distill tried set_adapters, raised, and re-raised 'no distill loaded'."""
+    from vivijure_backend.i2v import _set_distill
+
+    class BadSetAdaptersPipe:
+        _vj_i2v_distill_loaded = True
+        _vj_i2v_distill_fused = True  # LightX2V baked: treat as fused
+
+        def set_adapters(self, *a, **kw):
+            raise RuntimeError("set_adapters should not be called on a baked-delta pipe")
+
+    _set_distill(BadSetAdaptersPipe(), True)   # must NOT raise
+    _set_distill(BadSetAdaptersPipe(), False)  # must NOT raise

@@ -475,8 +475,9 @@ def _try_lightx2v_distill(pipe, distill_spec) -> bool:
     - LoRA key prefix format (transformer.* vs diffusion_model.*).
     - Alpha key naming convention.
 
-    Returns True on success (sets distill_loaded=True, distill_fused=False so the caller
-    can toggle the adapter weight if the pipe later supports it), False on any error."""
+    Returns True on success (sets distill_loaded=True, distill_fused=True -- the weight
+    delta is baked, effectively fused; no adapter registered, _set_distill early-returns),
+    False on any error."""
     try:
         return _apply_lora_delta_to_wan(pipe, distill_spec)
     except Exception as e:  # noqa: BLE001
@@ -540,7 +541,10 @@ def _apply_lora_delta_to_wan(pipe, distill_spec) -> bool:
     print(f"i2v distill (manual delta): applied {applied} LoRA pairs from {distill_spec.repo_id}",
           flush=True)
     pipe._vj_i2v_distill_loaded = True
-    pipe._vj_i2v_distill_fused = False
+    # The delta is baked directly into the base weight matrices -- effectively fused.
+    # No adapter is registered, so _set_distill must NOT call set_adapters (it would KeyError).
+    # Mark fused=True so _set_distill takes the early-return path on every shot.
+    pipe._vj_i2v_distill_fused = True
     return True
 
 
