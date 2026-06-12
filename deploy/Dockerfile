@@ -64,9 +64,40 @@ RUN python -m pip install --upgrade pip wheel setuptools \
 COPY deploy/requirements.txt /tmp/requirements.txt
 RUN python -m pip install -r /tmp/requirements.txt
 
+# Compat patches for finishing-stage deps that predate the cu128 / numpy-2.x stack.
+# These are surgical sed passes over the three packages we know are affected; sed -i is a no-op
+# when a future pip release has already fixed the import, so the layer stays reproducible.
+#   (1) basicsr 0.4.2 imports torchvision.transforms.functional_tensor (removed in 0.17).
+#       facexlib and gfpgan occasionally share the same import; patch all three.
+#   (2) basicsr + facexlib use np.bool / np.int / np.float / np.complex aliases (removed in 1.24).
+RUN SITE=$(python -c "import site; print(site.getsitepackages()[0])") \
+    && for pkg in basicsr facexlib gfpgan; do \
+         [ -d "$SITE/$pkg" ] || continue; \
+         find "$SITE/$pkg" -name "*.py" -exec sed -i \
+           -e 's/torchvision\.transforms\.functional_tensor/torchvision.transforms.functional/g' \
+           -e 's/np\.bool\b/bool/g' \
+           -e 's/np\.int\b/int/g' \
+           -e 's/np\.float\b/float/g' \
+           -e 's/np\.complex\b/complex/g' \
+           -e 's/np\.object\b/object/g' \
+           -e 's/np\.str\b/str/g' \
+         {} +; \
+       done
+
+# Practical-RIFE: not on PyPI; clone and copy the rife/ package into /opt/vivijure so it resolves
+# as `import rife` on PYTHONPATH. Shallow clone keeps the layer small; git metadata is stripped.
+# touch __init__.py guarantees the directory is a proper package regardless of the upstream layout.
+RUN git clone --depth 1 https://github.com/hzwer/Practical_RIFE /tmp/rife-src \
+    && touch /tmp/rife-src/rife/__init__.py \
+    && cp -r /tmp/rife-src/rife /opt/vivijure/rife \
+    && rm -rf /tmp/rife-src
+
 # Our package. src/ layout -> /opt/vivijure/vivijure_backend, on PYTHONPATH.
 WORKDIR /opt/vivijure
 COPY src/vivijure_backend /opt/vivijure/vivijure_backend
+# Import smoke: run inside the image before pushing to catch missing runtime deps in seconds
+# rather than at the end of a 33-min GPU render. See Jenkinsfile stage 'import smoke'.
+COPY deploy/smoke_imports.py /opt/vivijure/smoke_imports.py
 
 # Model + sentinel root the cold-start mirror populates (HF_HOME lives under it).
 RUN mkdir -p /opt/models/hf-cache
