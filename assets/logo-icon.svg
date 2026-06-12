@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="skyphusion labs">
+  <!--
+    skyphusion labs - standalone icon (fusion-rising mark)
+    Three ascending streams that fuse into a single apex: "fusion rising"
+    (sky + phusion/fusion), not a bar chart. Deep-navy rounded square,
+    blue -> cyan diagonal gradient. Reads clean down to a 16px favicon.
+    Works on any background. Use this for:
+      - Cloudflare Access logo upload (convert to PNG with Inkscape or rsvg-convert)
+      - Favicons (trace to ICO or use as-is for modern browsers)
+      - Slack / Discord workspace icon
+    The original three-bar mark is preserved as logo-icon-bars.svg.
+  -->
+  <defs>
+    <linearGradient id="sky" x1="12" y1="52" x2="52" y2="14" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <radialGradient id="bg" cx="50%" cy="35%" r="70%">
+      <stop offset="0%"   stop-color="#17243d"/>
+      <stop offset="100%" stop-color="#0a0f1e"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="13" fill="url(#bg)"/>
+  <!-- left stream -->
+  <path d="M9 52L22.4 52L32 22L32 12Z" fill="url(#sky)"/>
+  <!-- center stream -->
+  <path d="M25.6 52L38.4 52L32 22Z" fill="url(#sky)"/>
+  <!-- right stream -->
+  <path d="M41.6 52L55 52L32 12L32 22Z" fill="url(#sky)"/>
+</svg>

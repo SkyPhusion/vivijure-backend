@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="skyphusion labs">
+  <!--
+    skyphusion labs - standalone icon (original three-bar mark, ALTERNATE)
+    Kept as the alternate to the fusion-rising mark in logo-icon.svg so the
+    refined mark and the original can be compared side by side. Three ascending
+    parallelogram bars, blue -> cyan diagonal gradient, deep-navy rounded square.
+    Works on any background. Use this for:
+      - Cloudflare Access logo upload (convert to PNG with Inkscape or rsvg-convert)
+      - Favicons (trace to ICO or use as-is for modern browsers)
+      - Slack / Discord workspace icon
+  -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="64" x2="64" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <radialGradient id="bg" cx="50%" cy="35%" r="70%">
+      <stop offset="0%"   stop-color="#17243d"/>
+      <stop offset="100%" stop-color="#0a0f1e"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="13" fill="url(#bg)"/>
+  <path d="M 7,52 L 15,52 L 21,36 L 13,36 Z" fill="url(#sky)"/>
+  <path d="M 21,52 L 29,52 L 38,28 L 30,28 Z" fill="url(#sky)"/>
+  <path d="M 35,52 L 43,52 L 55,20 L 47,20 Z" fill="url(#sky)"/>
+</svg>
