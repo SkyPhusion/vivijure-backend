@@ -115,6 +115,7 @@ class StubPipeline(GpuPipeline):
         self.trained: list[str] = []
         self.keyframed: list[str] = []
         self.animated: list[str] = []
+        self.finished: list[str] = []
         self.keyframe_loras: dict[str, list[str]] = {}
 
     def _train_slot(self, char, out_dir):
@@ -131,6 +132,12 @@ class StubPipeline(GpuPipeline):
     def _animate(self, scene, keyframe_path, prompt, out_path):
         assert Path(keyframe_path).exists(), "animating from a keyframe that was never staged"
         self.animated.append(scene.id)
+        out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"x"); return out_path
+
+    def _finish_clip(self, shot_id, in_path, out_path):
+        assert Path(in_path).exists(), "finishing a clip that was never animated"
+        self.finished.append(shot_id)
         out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(b"x"); return out_path
 
@@ -151,6 +158,10 @@ def test_execute_trains_keyframes_and_animates_the_whole_plan(tmp_path):
     assert sorted(pipe.keyframed) == ["shot_01", "shot_02"]
     assert sorted(pipe.animated) == ["shot_01", "shot_02", "shot_03"]  # all needs_i2v, inject staged
     assert [s for s, _ in out.clips] == ["shot_01", "shot_02", "shot_03"]
+    # final tier has finish enabled, so every animated clip is finished and the finished path replaces
+    # the raw clip in the outputs (clip order preserved for the storyboard concat)
+    assert pipe.finished == ["shot_01", "shot_02", "shot_03"]
+    assert all("/finished/" in str(p) for _, p in out.clips)
     # keyframing saw the freshly trained adapters
     assert pipe.keyframe_loras["shot_02"] == ["A", "B"]
 
@@ -188,6 +199,29 @@ def test_execute_skips_i2v_when_reused_keyframe_is_missing(tmp_path):
     out = pipe.execute(plan, bundle, tmp_path / "work")   # shot_01 keyframe not staged
     assert "shot_01" not in pipe.animated
     assert "shot_01" not in [s for s, _ in out.clips]
+
+
+def test_execute_finishes_clips_only_when_finish_is_enabled(tmp_path):
+    # Draft tier finishes nothing (a fast preview): the raw i2v clips ship unchanged, _finish_clip
+    # is never called. Final tier finishes every clip. This is the gate `config.finish.enabled`.
+    bundle = _extract_bundle(tmp_path)
+    req = RenderRequest.from_dict({"action": "render", "project": "neon",
+                                   "bundle_key": "x", "quality_tier": "draft"})
+    plan = make_plan(req, bundle.storyboard)
+    pipe = StubPipeline(req.config)
+    assert pipe.config.finish.enabled is False         # draft baseline: both passes off
+    out = pipe.execute(plan, bundle, tmp_path / "work-draft")
+    assert pipe.finished == []                          # finish stage skipped entirely
+    assert all("/finished/" not in str(p) for _, p in out.clips)   # raw i2v clips ship as-is
+
+    # A draft render that explicitly turns interpolation on DOES finish (the override re-enables it).
+    req2 = RenderRequest.from_dict({"action": "render", "project": "neon", "bundle_key": "x",
+                                    "quality_tier": "draft",
+                                    "render_overrides": {"finish": {"interpolate": True}}})
+    pipe2 = StubPipeline(req2.config)
+    assert pipe2.config.finish.enabled is True
+    pipe2.execute(make_plan(req2, bundle.storyboard), bundle, tmp_path / "work-draft2")
+    assert pipe2.finished == ["shot_01", "shot_02", "shot_03"]
 
 
 # --------------------------------------------------------------------- run_job end to end
