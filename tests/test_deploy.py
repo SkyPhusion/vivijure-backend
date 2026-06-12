@@ -91,12 +91,16 @@ def test_build_pipeline_shares_one_model_server_across_jobs():
 
 def test_model_server_uses_job_config_specs(monkeypatch):
     """Cold-start: the first job's model fields must reach ModelServer.specs."""
-    from vivijure_backend.models import ModelRole
+    from vivijure_backend.models import ModelRole, DEFAULT_SPECS
     monkeypatch.setattr(worker, "_SERVER", None)
     req = _req(render_overrides={"keyframe": {"base_model": "custom/sdxl-base"}})
     pipe = worker.build_pipeline(req)
     assert worker._SERVER is not None
     assert worker._SERVER.specs[ModelRole.KEYFRAME_BASE].repo_id == "custom/sdxl-base"
+    # weight_name and other non-repo fields must be preserved (regression: positional ModelSpec
+    # construction dropped weight_name and broke the keyframe distill LoRA load)
+    assert (worker._SERVER.specs[ModelRole.KEYFRAME_FEWSTEP].weight_name
+            == DEFAULT_SPECS[ModelRole.KEYFRAME_FEWSTEP].weight_name)
     # warm-worker path: second job gets the SAME server (model already loaded)
     req2 = _req(render_overrides={"keyframe": {"base_model": "other/sdxl"}})
     pipe2 = worker.build_pipeline(req2)

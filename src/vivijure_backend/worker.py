@@ -11,6 +11,8 @@ module (and `build_pipeline`) import and test without a GPU.
 """
 from __future__ import annotations
 
+import dataclasses
+
 from .contract import RenderRequest
 from .harness.pipeline_registry import register_pipeline
 from .pipeline import GpuPipeline
@@ -29,20 +31,22 @@ def _server(req: RenderRequest | None = None):
     pod restart. If `req` is None the server uses DEFAULT_SPECS (e.g. standalone test usage)."""
     global _SERVER
     if _SERVER is None:
-        from .models import ModelServer, ModelSpec, ModelRole, DEFAULT_SPECS  # deferred: torch
+        from .models import ModelServer, ModelRole, DEFAULT_SPECS  # deferred: torch
         job_specs: dict = {}
         if req is not None:
             kc, ic = req.config.keyframe, req.config.i2v
-            D = DEFAULT_SPECS
+            # Use dataclasses.replace to override ONLY the repo_id, preserving weight_name and
+            # all other spec fields (KEYFRAME_FEWSTEP carries weight_name=<specific .safetensors>;
+            # rebuilding ModelSpec positionally drops it and breaks the distill LoRA load).
             job_specs = {
-                ModelRole.KEYFRAME_BASE: ModelSpec(
-                    ModelRole.KEYFRAME_BASE, kc.base_model, D[ModelRole.KEYFRAME_BASE].family),
-                ModelRole.KEYFRAME_FEWSTEP: ModelSpec(
-                    ModelRole.KEYFRAME_FEWSTEP, kc.distill_model, D[ModelRole.KEYFRAME_FEWSTEP].family),
-                ModelRole.I2V: ModelSpec(
-                    ModelRole.I2V, ic.model, D[ModelRole.I2V].family),
-                ModelRole.I2V_DISTILL: ModelSpec(
-                    ModelRole.I2V_DISTILL, ic.distill_model, D[ModelRole.I2V_DISTILL].family),
+                ModelRole.KEYFRAME_BASE: dataclasses.replace(
+                    DEFAULT_SPECS[ModelRole.KEYFRAME_BASE], repo_id=kc.base_model),
+                ModelRole.KEYFRAME_FEWSTEP: dataclasses.replace(
+                    DEFAULT_SPECS[ModelRole.KEYFRAME_FEWSTEP], repo_id=kc.distill_model),
+                ModelRole.I2V: dataclasses.replace(
+                    DEFAULT_SPECS[ModelRole.I2V], repo_id=ic.model),
+                ModelRole.I2V_DISTILL: dataclasses.replace(
+                    DEFAULT_SPECS[ModelRole.I2V_DISTILL], repo_id=ic.distill_model),
             }
         _SERVER = ModelServer(specs=job_specs or None)
     return _SERVER
@@ -52,7 +56,42 @@ def build_pipeline(req: RenderRequest) -> GpuPipeline:
     """The GPU pipeline for one job: the job's typed config + its pretrained-LoRA references,
     over the shared model server. The server is initialized from `req.config` model fields on
     the first (cold-start) job; subsequent jobs reuse the already-loaded model set."""
-    return GpuPipeline(config=req.config, pretrained_loras=req.pretrained_loras, server=_server(req))
+    server = _server(req)
+    _warn_model_divergence(req, server)
+    return GpuPipeline(config=req.config, pretrained_loras=req.pretrained_loras, server=server)
+
+
+def _warn_model_divergence(req: RenderRequest, server) -> None:
+    """Emit a structured warning when a warm-worker job requests different models than those loaded.
+
+    Specs freeze from the cold-start job. A warm worker cannot swap models without a restart; if it
+    silently renders on the wrong set the result looks valid but is produced by the wrong model.
+    The warning is best-effort (no import of torch/GPU deps) and printed to stdout so it appears in
+    RunPod logs and can be scraped; it does not fail the job (that requires a pod-restart policy)."""
+    try:
+        from .models import ModelRole, DEFAULT_SPECS
+        kc, ic = req.config.keyframe, req.config.i2v
+        checks = {
+            ModelRole.KEYFRAME_BASE: kc.base_model,
+            ModelRole.KEYFRAME_FEWSTEP: kc.distill_model,
+            ModelRole.I2V: ic.model,
+            ModelRole.I2V_DISTILL: ic.distill_model,
+        }
+        mismatches = {
+            role: (loaded.repo_id, requested)
+            for role, requested in checks.items()
+            if (loaded := server.specs.get(role)) and loaded.repo_id != requested
+        }
+        if mismatches:
+            import json, time
+            payload = {
+                "ts": time.time(),
+                "mismatches": {r.name: {"loaded": l, "requested": req}
+                               for r, (l, req) in mismatches.items()},
+            }
+            print("@event model_spec_divergence " + json.dumps(payload), flush=True)
+    except Exception:
+        pass  # never let a warning abort a job
 
 
 def handler(job: dict) -> dict:
