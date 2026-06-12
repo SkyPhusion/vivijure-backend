@@ -1,45 +1,28 @@
 """Config->engine mapping completeness guard.
 
-Every config field that drives a GPU parameter must appear in its engine params struct.
-A one-line assertion here catches a dropped knob before it silently ships ([B], [D]).
-
-Intentionally-unmapped fields are documented in UNMAPPED_* allowlists at the bottom.
+Two layers of protection:
+1. Behavioral assertions: each test drives the real mapper and checks a concrete value reaches
+   the engine param (catching dropped knobs like [B]'s missing height).
+2. Meta-test: dataclasses.fields() cross-checked against the asserted+allowlisted set so a
+   newly added config field FAILS until it is explicitly mapped or allowlisted.
+   This closes the "silent unmapped field" gap that #20 exists to prevent.
 """
 from __future__ import annotations
 
+import dataclasses
 import pytest
 
 from vivijure_backend.config import (
-    FaceRestore,
+    FeatureCache,
     FinishConfig,
     I2VConfig,
     KeyframeConfig,
-    MultiCharConfig,
-    Scheduler,
-    IdentityMethod,
     QualityTier,
     RenderConfig,
-    FeatureCache,
 )
-from vivijure_backend.keyframe import KeyframeParams
-from vivijure_backend.i2v import I2VParams
 from vivijure_backend.pipeline import keyframe_params_from, i2v_params_from, finish_params_from
 
 # ------------------------------------------------------------------ helpers
-
-def _kfcfg(**overrides) -> KeyframeConfig:
-    base = KeyframeConfig.for_tier(QualityTier.FINAL)
-    return KeyframeConfig.from_dict(overrides, tier=QualityTier.FINAL)
-
-
-def _i2vcfg(**overrides) -> I2VConfig:
-    return I2VConfig.from_dict(overrides, tier=QualityTier.FINAL)
-
-
-def _fincfg(**overrides) -> FinishConfig:
-    base = FinishConfig.from_dict(overrides)
-    return base
-
 
 def _scene(seconds=5.0):
     class S:
@@ -180,11 +163,23 @@ def test_i2v_negative_prompt_reaches_params():
 
 
 def test_i2v_num_frames_from_scene_duration():
-    # 5s * 16fps = 80 frames -> snap to 81 (4*20+1); verify config fps is used
+    # 5s * 16fps = 80 frames -> snap up to 81 (4*20+1)
     cfg = _rcfg(i2v={"fps": 16})
     p = i2v_params_from(cfg, _scene(5.0))
-    assert p.num_frames > 0
-    assert (p.num_frames - 1) % 4 == 0  # 4k+1 invariant
+    assert p.num_frames == 81
+    assert (p.num_frames - 1) % 4 == 0
+
+
+def test_i2v_seed_reaches_params():
+    cfg = _rcfg(i2v={"seed": 77777})
+    p = i2v_params_from(cfg, _scene())
+    assert p.seed == 77777
+
+
+def test_i2v_flow_shift_reaches_params():
+    cfg = _rcfg(i2v={"distill": False, "flow_shift": 3.5})
+    p = i2v_params_from(cfg, _scene())
+    assert p.flow_shift == pytest.approx(3.5)
 
 
 # -------------------------------------------------------- finish mapping
@@ -227,24 +222,79 @@ def test_finish_only_faces_reaches_params():
     assert p.only_faces is False
 
 
-# -------------------------------------------------------- allowlists
+# ------------------------------------------------------ completeness guard
+#
+# The sets below declare which fields are covered by the behavioral tests above
+# (ASSERTED) vs intentionally not forwarded to engine params (UNMAPPED).
+# The meta-tests use dataclasses.fields() to ensure every field in the config
+# dataclass appears in exactly one of these sets. A new config field therefore
+# fails CI until it is explicitly mapped or allowlisted.
 
-# Fields intentionally NOT forwarded to engine params (document them here so a reviewer
-# knows they're consciously excluded, not accidentally dropped):
+KEYFRAME_ASSERTED = {
+    "steps", "distill_steps", "guidance_scale", "width", "height", "seed",
+    "distill", "scheduler", "identity_method",
+    "instantid_controlnet_scale", "instantid_ip_adapter_scale",
+    "multi_char",
+}
+
 KEYFRAME_UNMAPPED = {
-    "base_model",     # deploy-time model repo (wired to ModelServer.specs at pod startup, not I/O params)
-    "distill_model",  # deploy-time model repo
-    "ip_adapter_scale",  # single-char IP-Adapter pull; KeyframeParams.ip_adapter_scale comes from
-                         # multi_char.ip_adapter_scale_per_slot. Single-char path reads it separately.
+    "base_model",      # deploy-time model repo; wired to ModelServer.specs at pod startup
+    "distill_model",   # deploy-time model repo
+    # ip_adapter_scale exists for the single-subject path but keyframe_params_from routes
+    # all paths through mc.ip_adapter_scale_per_slot instead. The field is parsed but
+    # not forwarded -- a known discrepancy. See issue for the follow-up fix.
+    "ip_adapter_scale",
+}
+
+I2V_ASSERTED = {
+    "num_frames", "fps", "steps", "distill_steps", "guidance_scale", "distill",
+    "feature_cache", "negative_prompt", "seed", "flow_shift",
 }
 
 I2V_UNMAPPED = {
-    "model",          # deploy-time model repo
-    "distill_model",  # deploy-time model repo
-    "seconds_per_shot",  # indirect: affects num_frames via I2VConfig.frames_for, not a direct param
-    "loader",         # model-loading strategy (diffusers vs LightX2V fallback), not a generation param
-    # "seed",         # NOW WIRED (PR #40); previously read from keyframe.seed
-    # "flow_shift",   # NOW WIRED (PR #40); previously not in I2VParams
+    "model",           # deploy-time model repo
+    "distill_model",   # deploy-time model repo
+    "seconds_per_shot",  # used by I2VConfig.frames_for() to derive num_frames; not a direct param
+    "loader",          # model-loading strategy (diffusers vs LightX2V); not a generation param
 }
 
-FINISH_UNMAPPED = set()  # all FinishConfig fields reach FinishParams
+FINISH_ASSERTED = {
+    "interpolate", "interpolation_factor", "target_fps",
+    "face_restore", "face_fidelity", "only_faces",
+}
+
+FINISH_UNMAPPED: set = set()
+
+
+def _top_level_field_names(cls) -> set[str]:
+    return {f.name for f in dataclasses.fields(cls)}
+
+
+def test_keyframe_config_fields_all_accounted_for():
+    """Every KeyframeConfig field must be in KEYFRAME_ASSERTED or KEYFRAME_UNMAPPED."""
+    fields = _top_level_field_names(KeyframeConfig)
+    unaccounted = fields - KEYFRAME_ASSERTED - KEYFRAME_UNMAPPED
+    assert not unaccounted, (
+        f"KeyframeConfig fields not covered: {sorted(unaccounted)}. "
+        "Add a behavioral test and add the field name to KEYFRAME_ASSERTED, "
+        "or add to KEYFRAME_UNMAPPED with rationale.")
+
+
+def test_i2v_config_fields_all_accounted_for():
+    """Every I2VConfig field must be in I2V_ASSERTED or I2V_UNMAPPED."""
+    fields = _top_level_field_names(I2VConfig)
+    unaccounted = fields - I2V_ASSERTED - I2V_UNMAPPED
+    assert not unaccounted, (
+        f"I2VConfig fields not covered: {sorted(unaccounted)}. "
+        "Add a behavioral test and add the field name to I2V_ASSERTED, "
+        "or add to I2V_UNMAPPED with rationale.")
+
+
+def test_finish_config_fields_all_accounted_for():
+    """Every FinishConfig field must be in FINISH_ASSERTED or FINISH_UNMAPPED."""
+    fields = _top_level_field_names(FinishConfig)
+    unaccounted = fields - FINISH_ASSERTED - FINISH_UNMAPPED
+    assert not unaccounted, (
+        f"FinishConfig fields not covered: {sorted(unaccounted)}. "
+        "Add a behavioral test and add the field name to FINISH_ASSERTED, "
+        "or add to FINISH_UNMAPPED with rationale.")
