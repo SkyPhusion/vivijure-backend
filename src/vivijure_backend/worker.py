@@ -18,18 +18,41 @@ from .pipeline import GpuPipeline
 _SERVER = None  # process-global ModelServer; warm workers reuse loaded models across jobs
 
 
-def _server():
+def _server(req: RenderRequest | None = None):
+    """Return the process-global ModelServer, building it on first call.
+
+    Model loading is expensive and models are shared across jobs on a warm worker, so the server
+    is a singleton. On first call, specs from `req.config` (keyframe base/distill, i2v base/distill)
+    are wired in so a non-default model repo configured in the job DOES take effect -- provided this
+    is the cold-start job. On subsequent calls (warm worker, server already built) the existing
+    model set is reused regardless of `req.config.*.model` fields; per-job hot-swapping requires a
+    pod restart. If `req` is None the server uses DEFAULT_SPECS (e.g. standalone test usage)."""
     global _SERVER
     if _SERVER is None:
-        from .models import ModelServer  # deferred: torch only loads on a real worker
-        _SERVER = ModelServer()
+        from .models import ModelServer, ModelSpec, ModelRole, DEFAULT_SPECS  # deferred: torch
+        job_specs: dict = {}
+        if req is not None:
+            kc, ic = req.config.keyframe, req.config.i2v
+            D = DEFAULT_SPECS
+            job_specs = {
+                ModelRole.KEYFRAME_BASE: ModelSpec(
+                    ModelRole.KEYFRAME_BASE, kc.base_model, D[ModelRole.KEYFRAME_BASE].family),
+                ModelRole.KEYFRAME_FEWSTEP: ModelSpec(
+                    ModelRole.KEYFRAME_FEWSTEP, kc.distill_model, D[ModelRole.KEYFRAME_FEWSTEP].family),
+                ModelRole.I2V: ModelSpec(
+                    ModelRole.I2V, ic.model, D[ModelRole.I2V].family),
+                ModelRole.I2V_DISTILL: ModelSpec(
+                    ModelRole.I2V_DISTILL, ic.distill_model, D[ModelRole.I2V_DISTILL].family),
+            }
+        _SERVER = ModelServer(specs=job_specs or None)
     return _SERVER
 
 
 def build_pipeline(req: RenderRequest) -> GpuPipeline:
     """The GPU pipeline for one job: the job's typed config + its pretrained-LoRA references,
-    over the shared model server."""
-    return GpuPipeline(config=req.config, pretrained_loras=req.pretrained_loras, server=_server())
+    over the shared model server. The server is initialized from `req.config` model fields on
+    the first (cold-start) job; subsequent jobs reuse the already-loaded model set."""
+    return GpuPipeline(config=req.config, pretrained_loras=req.pretrained_loras, server=_server(req))
 
 
 def handler(job: dict) -> dict:
