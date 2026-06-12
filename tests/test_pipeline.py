@@ -58,6 +58,34 @@ def test_keyframe_params_pull_multichar_scales():
     assert p.max_slots == 2
 
 
+def test_keyframe_params_default_size_is_square():
+    # Regression: with no override the keyframe stays 1024x1024, so existing square renders are
+    # unchanged.
+    p = keyframe_params_from(RenderConfig.for_tier(QualityTier.FINAL))
+    assert (p.width, p.height) == (1024, 1024)
+
+
+def test_keyframe_params_thread_both_dims_for_non_square():
+    # 16:9: BOTH width and height must reach the engine; before this fix only width survived and
+    # every keyframe came out square.
+    cfg = RenderConfig.from_request("final", {"keyframe": {"width": 1920, "height": 1080}})
+    p = keyframe_params_from(cfg)
+    assert (p.width, p.height) == (1920, 1080)
+
+
+def test_keyframe_params_thread_dims_from_resolution_string():
+    # The control plane's "WIDTHxHEIGHT" shape must survive config parse AND the engine mapping.
+    cfg = RenderConfig.from_request("final", {"keyframe": {"resolution": "1344x768"}})
+    p = keyframe_params_from(cfg)
+    assert (p.width, p.height) == (1344, 768)
+
+
+def test_keyframe_params_thread_a_vertical_size():
+    cfg = RenderConfig.from_request("final", {"keyframe": {"resolution": "720x1280"}})
+    p = keyframe_params_from(cfg)
+    assert (p.width, p.height) == (720, 1280)
+
+
 def test_i2v_params_track_tier_and_scene_duration():
     final = i2v_params_from(RenderConfig.for_tier(QualityTier.FINAL), Scene(prompt="x", target_seconds=4))
     assert final.distill is False and final.steps == 40

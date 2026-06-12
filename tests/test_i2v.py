@@ -7,6 +7,7 @@ from vivijure_backend.i2v import (
     DEFAULT_FPS,
     MAX_FRAMES,
     I2VParams,
+    animate,
     _set_feature_cache,
     _step_callback,
     clip_seconds,
@@ -137,6 +138,86 @@ def test_feature_cache_single_dit_pipe_still_works(monkeypatch):
     _set_feature_cache(pipe, FeatureCache.MIXCACHE)
     assert pipe.transformer.enabled == [0.20]
     assert not hasattr(pipe, "transformer_2")
+
+
+# ----------------------------------------------------- non-square size honored (item B)
+
+class _FakeImage:
+    def __init__(self, width, height):
+        self.width, self.height = width, height
+
+
+class _RecordingI2VPipe:
+    """Stand-in for the Wan i2v pipe: records the height/width it was called with so a test can
+    assert the clip is animated at the keyframe's real (possibly non-square) size."""
+    def __init__(self):
+        self.called = None
+        self.transformer = _FakeTransformer()
+    def set_adapters(self, names, adapter_weights):
+        pass
+    def __call__(self, **kwargs):
+        self.called = kwargs
+        class _Out:
+            frames = [["frame"]]
+        return _Out()
+
+
+def _stub_i2v_runtime(monkeypatch, image):
+    """Stub the heavy imports animate() defers (torch + diffusers.utils) so the engine body runs on
+    CPU. load_image returns our fake keyframe; export_to_video is a no-op recorder."""
+    import sys, types
+    torch = types.ModuleType("torch")
+
+    class _Gen:
+        def manual_seed(self, s):
+            return self
+    torch.Generator = lambda *a, **k: _Gen()
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    diffusers = sys.modules.get("diffusers") or types.ModuleType("diffusers")
+    utils = types.ModuleType("diffusers.utils")
+    utils.load_image = lambda path: image
+    utils.export_to_video = lambda frames, path, fps: None
+    diffusers.utils = utils
+    monkeypatch.setitem(sys.modules, "diffusers", diffusers)
+    monkeypatch.setitem(sys.modules, "diffusers.utils", utils)
+
+
+class _Server:
+    def __init__(self, pipe):
+        self._pipe = pipe
+    def i2v_pipeline(self):
+        return self._pipe
+
+
+def test_animate_honors_a_non_square_keyframe_size(tmp_path, monkeypatch):
+    # The keyframe is now 16:9; i2v must animate at that size, not collapse to a square. With
+    # height/width unset on the params, animate follows the loaded keyframe's real dimensions.
+    from vivijure_backend.contract import Scene
+    _stub_i2v_runtime(monkeypatch, _FakeImage(1920, 1080))
+    pipe = _RecordingI2VPipe()
+    animate(Scene(prompt="x", id="s"), tmp_path / "kf.png", "motion", _Server(pipe),
+            tmp_path / "out.mp4", params=I2VParams(num_frames=5, steps=1))
+    assert (pipe.called["width"], pipe.called["height"]) == (1920, 1080)
+
+
+def test_animate_honors_a_vertical_keyframe_size(tmp_path, monkeypatch):
+    from vivijure_backend.contract import Scene
+    _stub_i2v_runtime(monkeypatch, _FakeImage(720, 1280))
+    pipe = _RecordingI2VPipe()
+    animate(Scene(prompt="x", id="s"), tmp_path / "kf.png", "motion", _Server(pipe),
+            tmp_path / "out.mp4", params=I2VParams(num_frames=5, steps=1))
+    assert (pipe.called["width"], pipe.called["height"]) == (720, 1280)
+
+
+def test_animate_explicit_params_size_overrides_the_keyframe(tmp_path, monkeypatch):
+    # An explicit non-square size on the params wins over the keyframe's own dimensions.
+    from vivijure_backend.contract import Scene
+    _stub_i2v_runtime(monkeypatch, _FakeImage(1024, 1024))
+    pipe = _RecordingI2VPipe()
+    animate(Scene(prompt="x", id="s"), tmp_path / "kf.png", "motion", _Server(pipe),
+            tmp_path / "out.mp4", params=I2VParams(num_frames=5, steps=1, width=1280, height=720))
+    assert (pipe.called["width"], pipe.called["height"]) == (1280, 720)
 
 
 # ----------------------------------------------------- per-step progress callback (item M)

@@ -7,6 +7,7 @@ from vivijure_backend.keyframe import (
     DEFAULT_LORA_SCALE,
     KeyframeParams,
     _bind_loras,
+    _box_mask,
     _ensure_ip_adapter,
     _normalize_lora_state_dict,
     _pose_skeleton,
@@ -84,6 +85,43 @@ def test_region_gutter_carves_a_dead_band_between_regions():
     assert l1 - r0 == 64                    # a 64px dead band the masks cannot blend across
     # gutter=0 reproduces the old adjacent split exactly
     assert region_boxes(1024, 1024, 2, gutter=0) == [(0, 0, 512, 1024), (512, 0, 1024, 1024)]
+
+
+def test_two_regions_split_a_landscape_canvas_at_its_real_width():
+    # 16:9: the vertical split must run on the true width (1920), not a square dimension; each
+    # region keeps the full canvas height so a portrait subject is not clipped.
+    boxes = region_boxes(1920, 1080, 2)
+    assert boxes == [(0, 0, 960, 1080), (960, 0, 1920, 1080)]
+    assert all(t == 0 and b == 1080 for (l, t, r, b) in boxes)  # full height per region
+
+
+def test_two_regions_split_a_vertical_canvas():
+    # 9:16 portrait: still a side-by-side split, on the narrow width and tall height.
+    boxes = region_boxes(720, 1280, 2)
+    assert boxes == [(0, 0, 360, 1280), (360, 0, 720, 1280)]
+
+
+def test_box_mask_matches_a_non_square_canvas():
+    # The IP-Adapter region mask must be the canvas size (W x H), not a square, so it lines up
+    # with a 16:9 generation.
+    mask = _box_mask(1920, 1080, (0, 0, 960, 1080))
+    assert mask.size == (1920, 1080)
+    assert mask.getpixel((10, 10)) == 255       # inside the left region box
+    assert mask.getpixel((1900, 10)) == 0       # outside it (right half is black)
+
+
+def test_pose_skeleton_uses_the_non_square_canvas_and_both_halves():
+    boxes = region_boxes(1920, 1080, 2, gutter=64)
+    img = _pose_skeleton(1920, 1080, boxes)
+    assert img.size == (1920, 1080)             # rendered on the real 16:9 canvas
+    assert img.crop((0, 0, 960, 1080)).getbbox() is not None
+    assert img.crop((960, 0, 1920, 1080)).getbbox() is not None
+
+
+def test_keyframe_params_default_is_square():
+    # Regression: the default keyframe is still 1024x1024 so existing square renders are unchanged.
+    p = KeyframeParams()
+    assert (p.width, p.height) == (1024, 1024)
 
 
 def test_pose_skeleton_plants_one_figure_per_region():
