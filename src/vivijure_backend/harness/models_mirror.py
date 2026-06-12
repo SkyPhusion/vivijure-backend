@@ -113,6 +113,15 @@ def ensure_models(*, env: dict | None = None, log: Callable[[str], None] = print
     antelope.mkdir(parents=True, exist_ok=True)
     subprocess.run(mirror_cmd(conf, f"r2:{bucket}/models/antelopev2", antelope), check=True)
 
+    # Finishing-stage weights: stored at fixed paths under models_root (NOT in the HF cache).
+    # ModelServer.frame_interpolator loads $VJ_MODELS_ROOT/rife/flownet.pkl and
+    # ModelServer.face_restorer loads $VJ_MODELS_ROOT/GFPGANv1.4/GFPGANv1.4.pth directly,
+    # so they need their own R2 mirror legs separate from the HF-cache pull above.
+    for subdir in ("rife", "GFPGANv1.4"):
+        dst = models_root / subdir
+        dst.mkdir(parents=True, exist_ok=True)
+        subprocess.run(mirror_cmd(conf, f"r2:{bucket}/models/{subdir}", dst), check=True)
+
     # rclone --links stores HF-cache symlinks as `<name>.rclonelink` text files (the link target),
     # and rclone >= 1.7x does NOT translate them back to real symlinks on download -- it leaves the
     # marker files in place, so the snapshot dirs end up with `config.json.rclonelink` instead of

@@ -40,3 +40,19 @@ onnxruntime-gpu>=1.20
 # --- serverless SDK + R2 object I/O : floors (import-validated, not render-exercised) ---
 runpod>=1.6
 boto3>=1.34
+
+# --- finishing stage (RIFE interpolation + face restore) ---
+# av / PyAV: the imageio pyav plugin that finish_clip uses to decode/encode video clips.
+av==13.1.0
+# gfpgan: blind face restorer (GFPGAN path, the default). Pulls basicsr + facexlib as transitive deps.
+gfpgan==1.3.8
+# facexlib: face detection for gfpgan (and the optional codeformer path). Pinned explicitly
+# so the compat patches below stay reproducible regardless of what gfpgan's dep resolver picks.
+facexlib>=0.3.0
+# basicsr 0.4.2 (latest PyPI, pulled by gfpgan) needs two post-install compat patches applied in
+# the Dockerfile AFTER pip install: (1) torchvision.transforms.functional_tensor was removed in
+# 0.17; replace with torchvision.transforms.functional. (2) np.bool/int/float aliases were
+# removed in numpy 1.24; replace with builtins. Both patches are inert sed passes: no-op if
+# the file has already been updated by a newer release.
+# rife (Practical-RIFE frame interpolator): NOT on PyPI. Vendored in the Dockerfile via
+# git clone; the rife/ package lands on PYTHONPATH at /opt/vivijure/rife.
