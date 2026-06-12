@@ -40,7 +40,14 @@ def strip_typename(o):
 
 def prepare_template(tpl: dict, new_img: str) -> dict:
     """The SaveTemplateInput for re-pinning: the fetched template with imageName spliced to
-    `new_img` and `__typename` stripped. Pure (no network), so it is unit-testable."""
+    `new_img` and `__typename` stripped. Pure (no network), so it is unit-testable.
+
+    CRITICAL: a pin must change ONLY imageName and carry every other field through UNCHANGED --
+    especially `containerRegistryAuthId` (the GHCR pull credential, which lives on the template and
+    is already correct). The fetch query above requests it so it round-trips here untouched. Do NOT
+    omit it (saveTemplate would clear it -> a present-but-empty cred makes RunPod attempt an empty
+    login and FAIL the pull, even for public images) and do NOT hardcode it (clobbers the real cred).
+    Just preserve whatever was fetched."""
     tpl = json.loads(json.dumps(tpl))  # copy; never mutate the caller's dict
     tpl["imageName"] = new_img
     return strip_typename(tpl)
@@ -73,7 +80,7 @@ def main():
     fetch = gql(api_key, {
         "query": "{ myself { podTemplates { id name imageName containerDiskInGb "
                  "dockerArgs volumeInGb volumeMountPath ports env { key value } "
-                 "isServerless category readme } } }"
+                 "isServerless category readme containerRegistryAuthId } } }"
     })
     if "errors" in fetch:
         sys.exit(f"fetch errors: {json.dumps(fetch['errors'])}")

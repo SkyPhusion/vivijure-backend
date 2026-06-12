@@ -35,6 +35,29 @@ def test_prepare_template_splices_image_and_strips_typename():
     assert fetched["__typename"] == "PodTemplate"
 
 
+def test_prepare_template_preserves_registry_auth():
+    # A pin must change ONLY imageName and carry containerRegistryAuthId (the GHCR pull cred, which
+    # lives on the template and is already correct) through UNCHANGED. Clearing it (omit) OR changing
+    # it (hardcode) breaks the pull: a present-but-wrong/empty cred makes RunPod fail the login even
+    # for a public image.
+    pin = _load_pin_script()
+    fetched = {
+        "id": "tpl1", "imageName": "ghcr.io/skyphusion-labs/vivijure-backend:0.2.2",
+        "containerRegistryAuthId": "cmpjfaka40045l807oybv65gf",
+    }
+    out = pin.prepare_template(fetched, "ghcr.io/skyphusion-labs/vivijure-backend:0.2.3")
+    assert out["imageName"].endswith(":0.2.3")                              # version updated
+    assert out["containerRegistryAuthId"] == "cmpjfaka40045l807oybv65gf"    # cred untouched
+
+
+def test_fetch_query_requests_registry_auth():
+    # Regression guard for the prod bug: the fetch query OMITTED containerRegistryAuthId, so the
+    # round-tripped saveTemplate dropped it and RunPod cleared the cred. It must be fetched so it
+    # round-trips through prepare_template unchanged.
+    path = Path(__file__).resolve().parents[1] / "scripts" / "pin-runpod-template.py"
+    assert "containerRegistryAuthId" in path.read_text()
+
+
 def test_strip_typename_handles_nested_lists_and_dicts():
     pin = _load_pin_script()
     o = {"__typename": "A", "xs": [{"__typename": "B", "k": 1}, {"k": 2}]}
