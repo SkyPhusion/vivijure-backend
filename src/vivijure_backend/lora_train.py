@@ -21,8 +21,6 @@ module imports and unit-tests on a CPU box, the same convention `models.py` uses
 """
 from __future__ import annotations
 
-import string
-
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -75,32 +73,27 @@ def default_base_repo() -> str:
     return DEFAULT_SPECS[ModelRole.KEYFRAME_BASE].repo_id
 
 
-def _validate_caption_template(template: str) -> None:
-    """Reject templates with attribute-access or index placeholders and unknown field names.
-
-    Allows only {name} and {prompt}. A template like {name.__class__} or {x} would reach
-    str.format() and either expose internal object state or raise unexpectedly. Validation
-    runs at caption-generation time (not parse time) so bad templates are caught before any
-    training fires."""
-    allowed = {"name", "prompt"}
-    for _, field_name, _, _ in string.Formatter().parse(template):
-        if field_name is None:
-            continue
-        base = field_name.split(".")[0].split("[")[0]
-        if "." in field_name or "[" in field_name:
-            raise ValueError(
-                f"caption_template: attribute/index access not allowed: {{{field_name!r}}}")
-        if base and base not in allowed:
-            raise ValueError(
-                f"caption_template: unknown field {{{base!r}}}; only {{name}} and {{prompt}} are allowed")
-
-
 def caption_for(char: Character, template: str) -> str:
-    """The training caption for a slot. Falls back to the name alone when the registry has no
-    prompt, and collapses the template's stray punctuation so an empty field never leaks a
-    dangling comma into the caption."""
-    _validate_caption_template(template)
-    text = template.format(name=char.name or char.slot, prompt=char.prompt or "")
+    """The training caption for a slot.
+
+    Uses simple str.replace substitution (not str.format) so the template cannot carry
+    attribute-access or format_spec payloads like {name:{prompt.__class__.__mro__}}. A
+    template with unrecognised placeholders has them left literal rather than raising (safe
+    default). Falls back to the name alone when the registry has no prompt, and collapses
+    stray punctuation so an empty field never leaks a dangling comma."""
+    if "{" in template or "}" in template:
+        # Reject any remaining braces after substitution to prevent future .format() reuse
+        # and catch templates with unknown placeholders that signal a mis-authored config.
+        filled = template.replace("{name}", char.name or char.slot).replace(
+            "{prompt}", char.prompt or "")
+        remaining_braces = [c for c in filled if c in "{}"]
+        if remaining_braces:
+            raise ValueError(
+                f"caption_template contains unsupported placeholders: {template!r}; "
+                "only {name} and {prompt} are allowed")
+        text = filled
+    else:
+        text = template
     return ", ".join(part.strip() for part in text.split(",") if part.strip())
 
 
