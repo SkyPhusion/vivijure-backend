@@ -84,13 +84,23 @@ RUN SITE=$(python -c "import site; print(site.getsitepackages()[0])") \
          {} +; \
        done
 
-# Practical-RIFE: not on PyPI; clone and copy the rife/ package into /opt/vivijure so it resolves
-# as `import rife` on PYTHONPATH. Shallow clone keeps the layer small; git metadata is stripped.
-# touch __init__.py guarantees the directory is a proper package regardless of the upstream layout.
-RUN git clone --depth 1 https://github.com/hzwer/Practical_RIFE /tmp/rife-src \
-    && touch /tmp/rife-src/rife/__init__.py \
-    && cp -r /tmp/rife-src/rife /opt/vivijure/rife \
-    && rm -rf /tmp/rife-src
+# RIFE (ECCV2022 HDv3 lineage): not on PyPI, and the upstream GitHub repos do NOT ship an
+# importable `rife/` package (Practical-RIFE's tree is demo/ + model/, no rife/RIFE_HDv3.py). We
+# vendor a complete, self-consistent `rife/` package so `from rife.RIFE_HDv3 import Model`
+# (models.py) resolves on PYTHONPATH. Source: the svjack/CogVideoX-5B-Space HF space, whose rife/
+# package is the ECCV2022-RIFE HDv3 code with clean intra-package relative imports
+# (RIFE_HDv3 -> .IFNet_HDv3 / .warplayer / .loss). This is the SAME RIFE_HDv3/IFNet(c=90) lineage
+# as the seeded varnish flownet.pkl (models mirror -> $VJ_MODELS_ROOT/rife/flownet.pkl), so the
+# state_dict loads without a key mismatch (the loader passes rank=-1 to strip the `module.` prefix).
+# No model weights are baked here; only the ~25KB of inference code. Pinned to a HF revision so the
+# layer is reproducible.
+ARG VJ_RIFE_REPO=https://huggingface.co/spaces/svjack/CogVideoX-5B-Space
+ARG VJ_RIFE_REV=main
+RUN mkdir -p /opt/vivijure/rife \
+    && for f in __init__.py RIFE_HDv3.py IFNet_HDv3.py warplayer.py loss.py; do \
+         curl -fsSL "${VJ_RIFE_REPO}/resolve/${VJ_RIFE_REV}/rife/${f}" -o "/opt/vivijure/rife/${f}"; \
+       done \
+    && touch /opt/vivijure/rife/__init__.py
 
 # Our package. src/ layout -> /opt/vivijure/vivijure_backend, on PYTHONPATH.
 WORKDIR /opt/vivijure

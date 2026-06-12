@@ -18,7 +18,7 @@ CHECKS = [
     ("gfpgan",                                   "GFPGAN blind face restorer"),
     ("basicsr.utils.registry",                   "basicsr ARCH_REGISTRY (codeformer path)"),
     ("facexlib.utils.face_restoration_helper",   "facexlib face detection helper"),
-    ("rife.RIFE_HDv3",                           "Practical-RIFE frame interpolator"),
+    ("rife.RIFE_HDv3",                           "vendored RIFE HDv3 frame interpolator (Model loader)"),
     ("vivijure_backend.finish",                  "finishing stage (must stay CPU-importable)"),
 ]
 
