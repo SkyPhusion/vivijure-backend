@@ -22,11 +22,11 @@ def test_prepare_template_splices_image_and_strips_typename():
     pin = _load_pin_script()
     fetched = {
         "__typename": "PodTemplate", "id": "tpl1", "name": "vj-backend",
-        "imageName": "ghcr.io/skyphusion/vivijure-backend:0.1.0",
+        "imageName": "ghcr.io/skyphusion-labs/vivijure-backend:0.1.0",
         "env": [{"__typename": "EnvVar", "key": "HF_HOME", "value": "/opt/models/hf-cache"}],
     }
-    out = pin.prepare_template(fetched, "ghcr.io/skyphusion/vivijure-backend:0.2.0")
-    assert out["imageName"] == "ghcr.io/skyphusion/vivijure-backend:0.2.0"
+    out = pin.prepare_template(fetched, "ghcr.io/skyphusion-labs/vivijure-backend:0.2.0")
+    assert out["imageName"] == "ghcr.io/skyphusion-labs/vivijure-backend:0.2.0"
     assert "__typename" not in out
     assert "__typename" not in out["env"][0]          # stripped recursively
     assert out["env"][0]["key"] == "HF_HOME"           # real fields preserved

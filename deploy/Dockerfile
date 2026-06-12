@@ -13,7 +13,7 @@
 # line. Any sm_70+ card (incl. the H100/H200 validation boxes) also runs cu128.
 #
 # Build context is the REPO ROOT (so `COPY src/...` resolves):
-#   docker build -f deploy/Dockerfile -t ghcr.io/skyphusion/vivijure-backend:<ver> .
+#   docker build -f deploy/Dockerfile -t ghcr.io/skyphusion-labs/vivijure-backend:<ver> .
 
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 

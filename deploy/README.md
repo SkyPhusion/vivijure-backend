@@ -22,13 +22,13 @@ Build + push happen on a `backend-vX.Y.Z` tag (see `../Jenkinsfile`); a plain co
 ```bash
 git push origin main
 git tag backend-v0.1.0 && git push origin backend-v0.1.0
-#   -> ghcr.io/skyphusion/vivijure-backend:0.1.0 (+ :latest)
+#   -> ghcr.io/skyphusion-labs/vivijure-backend:0.1.0 (+ :latest)
 ```
 
 Build context is the repo root; the Dockerfile is `deploy/Dockerfile`. Local build:
 
 ```bash
-docker build -f deploy/Dockerfile -t ghcr.io/skyphusion/vivijure-backend:dev .
+docker build -f deploy/Dockerfile -t ghcr.io/skyphusion-labs/vivijure-backend:dev .
 ```
 
 ## Deploy (pin the RunPod template; separate + deliberate)
@@ -37,7 +37,7 @@ Building does not touch the live endpoint. Pin it to a built image when ready:
 
 ```bash
 RUNPOD_API_KEY=... RUNPOD_TEMPLATE_ID=... \
-  python3 scripts/pin-runpod-template.py ghcr.io/skyphusion/vivijure-backend:0.1.0
+  python3 scripts/pin-runpod-template.py ghcr.io/skyphusion-labs/vivijure-backend:0.1.0
 ```
 
 New endpoint workers pull the pinned image on their next cold start.
