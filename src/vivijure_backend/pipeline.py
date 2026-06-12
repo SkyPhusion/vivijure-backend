@@ -49,7 +49,8 @@ def keyframe_params_from(config: RenderConfig) -> KeyframeParams:
     return KeyframeParams(
         steps=kc.distill_steps if kc.distill else kc.steps,
         guidance_scale=kc.guidance_scale,
-        resolution=kc.width,                       # engine renders square; width is the side
+        width=kc.width,                            # both dims flow through; non-square is honored
+        height=kc.height,                          # (16:9 / vertical), not collapsed to a square
         seed=kc.seed,
         few_step=kc.distill,
         scheduler=kc.scheduler.value,              # ddim_trailing on the few-step path, a solver on final

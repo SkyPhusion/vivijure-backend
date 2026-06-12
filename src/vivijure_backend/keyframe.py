@@ -44,7 +44,8 @@ class KeyframeParams:
     these per job."""
     steps: int = 8
     guidance_scale: float = 5.0
-    resolution: int = 1024
+    width: int = 1024                # SDXL native side; non-square (16:9 / vertical) is honored
+    height: int = 1024               # the two dims are threaded independently through the engine
     seed: int = 0
     few_step: bool = True            # use the Hyper-SD/DMD2 distilled path the ModelServer loaded
     scheduler: str = "ddim_trailing" # config.Scheduler value; few-step wants ddim_trailing, final a solver
@@ -206,8 +207,8 @@ def _render_single(pipe, prompt, scene, cast, cfg, loras, generator):
     return pipe(
         prompt=prompt, negative_prompt=cfg.negative_prompt,
         num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
-        height=cfg.resolution, width=cfg.resolution, generator=generator,
-        image=_blank_control(cfg.resolution, cfg.resolution),
+        height=cfg.height, width=cfg.width, generator=generator,
+        image=_blank_control(cfg.width, cfg.height),
         controlnet_conditioning_scale=0.0,
         **({"ip_adapter_image": ip_images[0]} if ip_images else {}),
     ).images[0]
@@ -220,8 +221,8 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
     from diffusers.image_processor import IPAdapterMaskProcessor
 
     slots = scene.character_slots[:cfg.max_slots]
-    res = cfg.resolution
-    boxes = region_boxes(res, res, len(slots), orientation="vertical", gutter=cfg.region_gutter)
+    w, h = cfg.width, cfg.height
+    boxes = region_boxes(w, h, len(slots), orientation="vertical", gutter=cfg.region_gutter)
 
     _bind_loras(pipe, {s: loras[s] for s in slots if s in loras}, cfg.lora_scale,
                 few_step=cfg.few_step)
@@ -231,7 +232,7 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
     pipe.set_ip_adapter_scale([cfg.ip_adapter_scale] * len(slots))
     ip_images = [_ref_images(cast, s, count=1)[0] for s in slots]
     masks = IPAdapterMaskProcessor().preprocess(
-        [_box_mask(res, res, b) for b in boxes], height=res, width=res)
+        [_box_mask(w, h, b) for b in boxes], height=h, width=w)
 
     # Plant two distinct bodies: an OpenPose skeleton with one standing figure per region box, so
     # the masked IP-Adapter identities land on SEPARATE people instead of merging into one (the
@@ -241,17 +242,17 @@ def _render_regional(pipe, prompt, scene, cast, cfg, loras, generator, pose_imag
     if cfg.pose_conditioning:
         if pose_image is not None:
             from PIL import Image
-            control = Image.open(pose_image).convert("RGB").resize((res, res))
+            control = Image.open(pose_image).convert("RGB").resize((w, h))
         else:
-            control = _pose_skeleton(res, res, boxes)
+            control = _pose_skeleton(w, h, boxes)
         cn_scale = cfg.controlnet_pose_scale
     else:
-        control = _blank_control(res, res)
+        control = _blank_control(w, h)
         cn_scale = 0.0
     return pipe(
         prompt=prompt, negative_prompt=cfg.negative_prompt,
         num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
-        height=res, width=res, generator=generator,
+        height=h, width=w, generator=generator,
         ip_adapter_image=ip_images,
         cross_attention_kwargs={"ip_adapter_masks": masks},
         image=control,
@@ -295,7 +296,7 @@ def _render_instantid(server, prompt, scene, cast, cfg, loras, slot):
         return pipe(
             prompt=prompt, negative_prompt=cfg.negative_prompt,
             num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
-            height=cfg.resolution, width=cfg.resolution, generator=generator,
+            height=cfg.height, width=cfg.width, generator=generator,
         ).images[0]
     finally:
         for proc in pipe._vj_id_attn.values():
