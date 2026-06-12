@@ -267,6 +267,7 @@ class I2VConfig:
     distill_steps: int = 4           # 1..8; Lightning runs 4
     loader: I2VLoader = I2VLoader.DIFFUSERS
     feature_cache: FeatureCache = FeatureCache.NONE
+    seed: int = 0                    # >=0; i2v RNG seed, independent of the keyframe seed
     negative_prompt: str = ""        # optional; empty = the model's shipped default negative
 
     @classmethod
@@ -308,6 +309,7 @@ class I2VConfig:
             distill_steps=_clamp_int(d.get("distill_steps"), 1, 8, base.distill_steps),
             loader=_enum_or(I2VLoader, d.get("loader"), base.loader),
             feature_cache=cache,
+            seed=_clamp_int(d.get("seed"), 0, 2**31 - 1, base.seed),
             negative_prompt=str(d.get("negative_prompt", base.negative_prompt)),
         )
 

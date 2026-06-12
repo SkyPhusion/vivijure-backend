@@ -262,6 +262,23 @@ def test_snap_frames_to_4k_plus_1():
     assert snap_frames(1) == 1
 
 
+def test_snap_frames_does_not_exceed_ceiling():
+    # snap(256) would round UP to 257; must clamp to 253 (the largest 4k+1 <= 256)
+    result = snap_frames(256)
+    assert result == 253
+    assert (result - 1) % 4 == 0
+
+
+def test_snap_frames_max_frames_param():
+    assert snap_frames(81, max_frames=81) == 81   # exactly at ceiling, already valid
+    # 82 snaps up to 85 > 81; step down: prev = 81 - (81-1)%4 = 81 (valid, 4*20+1)
+    assert snap_frames(82, max_frames=81) == 81
+    assert (81 - 1) % 4 == 0
+    # with max=80: 80 snaps to 81 > 80; step down to 77 (4*19+1)
+    assert snap_frames(80, max_frames=80) == 77
+    assert (77 - 1) % 4 == 0
+
+
 def test_frames_for_target_duration():
     assert frames_for(5, 16) == 81       # 80 -> snapped 81
     assert frames_for(4, 16) == 65       # 64 -> snapped 65
@@ -306,3 +323,118 @@ def test_default_params_are_the_distilled_path():
     assert p.steps == 4
     assert p.fps == DEFAULT_FPS
     assert p.num_frames == MAX_FRAMES
+
+
+# ---------------------------------------------------------- flow_shift field + application
+
+def test_i2v_params_has_flow_shift_field():
+    p = I2VParams()
+    assert hasattr(p, "flow_shift")
+    assert p.flow_shift == 5.0
+
+
+def test_i2v_params_flow_shift_is_independent():
+    p = I2VParams(flow_shift=3.0)
+    assert p.flow_shift == 3.0
+
+
+# ---------------------------------------------------------- _set_distill guard (#16)
+
+class _DistillAwarePipe:
+    """Minimal stand-in for the Wan i2v pipe with distill state tracking."""
+    def __init__(self, loaded=None, fused=False):
+        if loaded is not None:
+            self._vj_i2v_distill_loaded = loaded
+        self._vj_i2v_distill_fused = fused
+        self.transformer = _FakeTransformer()
+        self.adapter_calls = []
+
+    def set_adapters(self, names, adapter_weights):
+        self.adapter_calls.append((names, adapter_weights))
+
+
+def test_set_distill_raises_when_no_distill_loaded_and_distill_true():
+    from vivijure_backend.i2v import _set_distill
+    import pytest
+    pipe = _DistillAwarePipe(loaded=False, fused=False)
+    with pytest.raises(RuntimeError, match="4-step-no-distill"):
+        _set_distill(pipe, True)
+
+
+def test_set_distill_silent_when_no_distill_loaded_and_distill_false():
+    from vivijure_backend.i2v import _set_distill
+    pipe = _DistillAwarePipe(loaded=False, fused=False)
+    _set_distill(pipe, False)   # must not raise; running full-step is fine
+    assert pipe.adapter_calls == []
+
+
+def test_set_distill_returns_early_when_fused_and_distill_true():
+    from vivijure_backend.i2v import _set_distill
+    pipe = _DistillAwarePipe(loaded=True, fused=True)
+    _set_distill(pipe, True)    # fused = already distilled; no toggle needed
+    assert pipe.adapter_calls == []
+
+
+def test_set_distill_returns_early_when_fused_and_distill_false():
+    from vivijure_backend.i2v import _set_distill
+    pipe = _DistillAwarePipe(loaded=True, fused=True)
+    _set_distill(pipe, False)   # can't un-fuse; caller controls step count
+    assert pipe.adapter_calls == []
+
+
+def test_set_distill_toggles_unfused_adapter_on():
+    from vivijure_backend.i2v import _set_distill
+    pipe = _DistillAwarePipe(loaded=True, fused=False)
+    _set_distill(pipe, True)
+    assert pipe.adapter_calls == [(["distill"], [1.0])]
+
+
+def test_set_distill_toggles_unfused_adapter_off():
+    from vivijure_backend.i2v import _set_distill
+    pipe = _DistillAwarePipe(loaded=True, fused=False)
+    _set_distill(pipe, False)
+    assert pipe.adapter_calls == [(["distill"], [0.0])]
+
+
+def test_set_distill_legacy_pipe_without_tags_is_tolerant():
+    from vivijure_backend.i2v import _set_distill
+    # Old pipe with no _vj_i2v_distill_loaded tag: treat as "unknown", best-effort toggle
+    class LegacyPipe:
+        adapter_calls = []
+        transformer = _FakeTransformer()
+        def set_adapters(self, names, adapter_weights):
+            self.adapter_calls.append((names, adapter_weights))
+    pipe = LegacyPipe()
+    _set_distill(pipe, True)    # loaded is None (no tag) -> skip the guard, attempt toggle
+    # Either succeeds (fine) or swallows (fine); must not raise
+
+
+# ------------------------------------------------- frame ceiling reconciliation (#15)
+
+def test_frames_for_respects_max_frames_parameter():
+    # The engine ceiling is 81 (MAX_FRAMES) but the config can request higher durations.
+    # frames_for with a custom ceiling must honor it.
+    assert frames_for(10, 16, max_frames=161) == 161  # 160 -> snapped to 161
+    assert frames_for(10, 16, max_frames=81) == 81    # capped at engine default
+
+
+def test_frames_for_snaps_to_4k_plus_1_even_with_custom_ceiling():
+    n = frames_for(10, 16, max_frames=200)
+    assert (n - 1) % 4 == 0, f"{n} is not 4k+1"
+
+
+def test_set_distill_fused_guard_covers_lightx2v_path():
+    """When LightX2V baked the delta (loaded=True, fused=True), _set_distill must early-return
+    regardless of the distill flag, not call set_adapters. This was the bug: LightX2V set
+    fused=False so _set_distill tried set_adapters, raised, and re-raised 'no distill loaded'."""
+    from vivijure_backend.i2v import _set_distill
+
+    class BadSetAdaptersPipe:
+        _vj_i2v_distill_loaded = True
+        _vj_i2v_distill_fused = True  # LightX2V baked: treat as fused
+
+        def set_adapters(self, *a, **kw):
+            raise RuntimeError("set_adapters should not be called on a baked-delta pipe")
+
+    _set_distill(BadSetAdaptersPipe(), True)   # must NOT raise
+    _set_distill(BadSetAdaptersPipe(), False)  # must NOT raise

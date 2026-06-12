@@ -44,6 +44,7 @@ class I2VParams:
     width: int | None = None
     negative_prompt: str = "static, still, frozen, jpeg artifacts, blurry, watermark"
     feature_cache: FeatureCache = FeatureCache.NONE  # final=MIXCACHE, standard=EASYCACHE, draft=NONE
+    flow_shift: float = 5.0           # FlowMatch scheduler shift; Wan2.2 default; lower=faster motion
 
 
 @dataclass
@@ -58,12 +59,21 @@ class I2VResult:
 
 # --------------------------------------------------------------------------- pure helpers
 
-def snap_frames(n: int) -> int:
+def snap_frames(n: int, max_frames: int = 256) -> int:
     """Snap a frame count to the nearest valid 4k+1 the temporal VAE accepts (rounding up so a
-    clip never comes out shorter than asked), clamped to at least one frame."""
+    clip never comes out shorter than asked), clamped to [1, max_frames].
+
+    Rounding up from 256 would yield 257, which is valid temporally but exceeds the documented
+    Wan2.2 ceiling. snap-then-clamp to max_frames (defaulting to 256) rather than clamp-then-snap
+    so the result is always 4k+1 even after the ceiling is applied: if n=256 would round up to 257,
+    we step down to the previous valid value (253 = 4*63+1)."""
     n = max(1, int(n))
-    rem = (n - 1) % TEMPORAL_STRIDE
-    return n if rem == 0 else n + (TEMPORAL_STRIDE - rem)
+    snapped = n if (n - 1) % TEMPORAL_STRIDE == 0 else n + (TEMPORAL_STRIDE - (n - 1) % TEMPORAL_STRIDE)
+    if snapped <= max_frames:
+        return snapped
+    # snapped exceeded ceiling: step back to the largest 4k+1 <= max_frames
+    prev = max_frames - (max_frames - 1) % TEMPORAL_STRIDE
+    return max(1, prev)
 
 
 def frames_for(target_seconds: float | None, fps: int = DEFAULT_FPS, *, max_frames: int = MAX_FRAMES) -> int:
@@ -129,6 +139,7 @@ def animate(
 
     pipe = server.i2v_pipeline()
     _set_distill(pipe, cfg.distill)
+    _apply_flow_shift(pipe, cfg.flow_shift)
     _set_feature_cache(pipe, cfg.feature_cache)  # per-shot: reset + (re)install, never leak across shots
     step_callback = _step_callback(progress_cb, cfg.steps)
     frames = pipe(
@@ -239,14 +250,70 @@ def _set_feature_cache(pipe, feature_cache) -> None:
                   f"to {type(t).__name__} ({e}); that expert runs uncached.", flush=True)
 
 
+
+def _apply_flow_shift(pipe, flow_shift: float) -> None:
+    """Apply the FlowMatch scheduler shift for this shot on the warm shared pipe.
+
+    Wan2.2 defaults to shift=5.0 at load time; lower values produce faster motion, higher
+    values slow it. The shift is reset per shot so a warm pipe never carries a prior shot's
+    value. Best-effort: a scheduler that does not expose `shift` (or where the rebuild fails)
+    runs with whatever shift it was initialized with rather than failing the render.
+
+    Pod-validate: confirm FlowMatchEulerDiscreteScheduler.from_config(sched.config, shift=x)
+    accepts the Wan2.2 scheduler config without error."""
+    try:
+        sched = pipe.scheduler
+        current = getattr(sched, "shift", None)
+        if current is None:
+            print(f"i2v: scheduler {type(sched).__name__} has no `shift` attr; "
+                  f"flow_shift={flow_shift} skipped (scheduler default applies).", flush=True)
+            return
+        if abs(current - flow_shift) < 1e-6:
+            return  # already at the right shift; skip the rebuild
+        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(sched.config, shift=flow_shift)
+        print(f"i2v: flow_shift set to {flow_shift} (was {current:.4f})", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"i2v: flow_shift {flow_shift} not applied ({e!r}); using scheduler default.", flush=True)
+
+
 def _set_distill(pipe, distill: bool) -> None:
-    """Toggle the Wan2.2-Lightning distill LoRA the ModelServer attached: active for the few-step
-    path, scaled to zero for a full-step final render. Tolerant of a pipeline that never loaded
-    the distill LoRA (the #12535 path), where full-step is simply the default."""
+    """Gate the Wan2.2-Lightning distill LoRA for this shot.
+
+    ModelServer.i2v_pipeline() records `_vj_i2v_distill_loaded` (True/False) and
+    `_vj_i2v_distill_fused` (True when baked before fp8 quant). Raises when the job
+    requests the distilled path but no LoRA loaded -- 4-step-no-distill ships garbage
+    motion and must never silently reach the user.
+
+    On the fused path, weights are permanently baked in and toggling back to full-step
+    is not possible. distill=False on a fused pipe is noted and proceeds -- the model
+    renders with the distilled weights at the caller's step count, which is suboptimal
+    but not garbage. On the unfused adapter path (LightX2V future), set_adapters toggles."""
+    fused = getattr(pipe, "_vj_i2v_distill_fused", False)
+    loaded = getattr(pipe, "_vj_i2v_distill_loaded", None)
+
+    if loaded is False:
+        # ModelServer confirmed no distill LoRA -- the pipe runs full-step regardless.
+        if distill:
+            raise RuntimeError(
+                "i2v: 4-step distilled render requested but no Wan2.2-Lightning LoRA loaded "
+                "(both diffusers and LightX2V loaders failed). Refusing to ship 4-step-no-distill "
+                "output. Set VJ_I2V_DISTILL=0 in the pod env to force full-step rendering.")
+        return  # distill=False + no LoRA: already running full-step, nothing to do
+
+    if fused:
+        return  # baked-in distill; can't toggle; caller controls step count
+
+    # Unfused adapter path (LightX2V loader, or old pipe without state tags)
     try:
         if distill:
             pipe.set_adapters(["distill"], adapter_weights=[1.0])
         else:
             pipe.set_adapters(["distill"], adapter_weights=[0.0])
-    except Exception:
-        pass  # no distill adapter loaded -> already running full-step
+    except Exception as e:
+        if distill and loaded is True:
+            # Unfused adapter that claimed it loaded but can't be activated
+            raise RuntimeError(
+                f"i2v: distill adapter toggle failed with distill=True ({e!r}); "
+                "refusing 4-step-no-distill") from e
+        # distill=False toggle failed: running full-step -- acceptable

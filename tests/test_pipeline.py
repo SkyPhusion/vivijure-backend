@@ -394,3 +394,62 @@ def test_animate_wires_per_step_i2v_progress(tmp_path, monkeypatch):
     last = emitter._events[-1]
     assert last["event"] == "i2v_step" and last["shot"] == "shot_01"
     assert last["step"] == 7 and last["total"] == 40
+
+
+# ------------------------------------------------ i2v_params_from mapping (#15)
+
+def _render_config_for_i2v(overrides=None):
+    """Build a minimal RenderConfig with I2VConfig overrides for mapping tests."""
+    from vivijure_backend.config import RenderConfig
+    from vivijure_backend.routing import QualityTier
+    return RenderConfig.from_request(QualityTier.STANDARD, {"i2v": overrides or {}})
+
+
+def _scene(target=None):
+    from vivijure_backend.contract import Scene
+    d = {"id": "s1", "prompt": "motion"}
+    if target is not None:
+        d["target_seconds"] = target
+    return Scene.from_dict(d, 0)
+
+
+def test_i2v_params_from_maps_flow_shift():
+    from vivijure_backend.pipeline import i2v_params_from
+    cfg = _render_config_for_i2v({"flow_shift": 3.5})
+    p = i2v_params_from(cfg, _scene(2))
+    assert p.flow_shift == 3.5
+
+
+def test_i2v_params_from_maps_i2v_seed_not_keyframe_seed():
+    from vivijure_backend.pipeline import i2v_params_from
+    cfg = _render_config_for_i2v({"seed": 777})
+    p = i2v_params_from(cfg, _scene(2))
+    assert p.seed == 777
+
+
+def test_i2v_params_from_uses_seconds_per_shot_when_scene_has_no_duration():
+    from vivijure_backend.pipeline import i2v_params_from
+    from vivijure_backend.i2v import frames_for
+    cfg = _render_config_for_i2v({"seconds_per_shot": 3.0, "fps": 16})
+    p = i2v_params_from(cfg, _scene(None))
+    # seconds_per_shot=3.0 at 16fps -> 48 frames -> snap_frames(48) = 49
+    assert p.num_frames == 49
+
+
+def test_i2v_params_from_scene_duration_wins_over_seconds_per_shot():
+    from vivijure_backend.pipeline import i2v_params_from
+    cfg = _render_config_for_i2v({"seconds_per_shot": 3.0, "fps": 16})
+    p = i2v_params_from(cfg, _scene(2.0))
+    # 2s at 16fps = 32 frames -> snap_frames(32) = 33
+    assert p.num_frames == 33
+
+
+def test_i2v_params_from_respects_config_num_frames_ceiling():
+    from vivijure_backend.pipeline import i2v_params_from
+    from vivijure_backend.i2v import snap_frames
+    # The old code used the engine's frames_for (cap=81); now it uses ic.frames_for (cap=256).
+    # Verify a 10-second scene at 16fps gets frames snapped up to 161, not capped at 81.
+    cfg = _render_config_for_i2v({"fps": 16})
+    p = i2v_params_from(cfg, _scene(10.0))  # 10s * 16fps = 160 -> snap to 161
+    assert p.num_frames == 161  # not 81 (the old engine ceiling)
+    assert (p.num_frames - 1) % 4 == 0  # is 4k+1

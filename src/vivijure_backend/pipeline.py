@@ -29,7 +29,7 @@ from .config import RenderConfig
 from .harness.handler import Outputs
 from .harness.progress import NullEmitter
 from .keyframe import KeyframeParams, build_prompt
-from .i2v import I2VParams, frames_for
+from .i2v import I2VParams, frames_for, snap_frames
 from .orchestrator import KeyframeMode, RenderPlan
 from .contract import Bundle
 
@@ -68,20 +68,22 @@ def keyframe_params_from(config: RenderConfig) -> KeyframeParams:
 
 def i2v_params_from(config: RenderConfig, scene) -> I2VParams:
     """Map the typed `I2VConfig` (+ the scene's duration) onto the i2v engine's `I2VParams`.
-    Frame count is derived from the scene's target seconds at the config fps (snapped to the
-    temporal VAE's 4k+1 by `i2v.frames_for`); `distill` selects the 4-step Lightning path and its
-    step/guidance profile; `feature_cache` carries the tier's denoise accelerator (final=MIXCACHE,
-    standard=EASYCACHE, draft=NONE; `from_dict` already force-clears it to NONE under distill, so the
-    engine never sees a cache on a 4-step render). `flow_shift` / `loader` are still not surfaced by
-    `I2VParams` (lower-priority gaps), so they remain unmapped."""
+
+    Frame count derives from the scene's target seconds via `I2VConfig.frames_for`, which
+    respects the configured `seconds_per_shot` fallback and the 1..256 ceiling (the engine
+    snaps to 4k+1 from there). `flow_shift` is threaded to the scheduler per shot. `seed` is
+    the i2v-specific seed so motion can be re-rolled without re-rolling the keyframe. `distill`
+    selects the 4-step Lightning path; `feature_cache` carries the tier's accelerator."""
     ic = config.i2v
+    target = scene.target_seconds if (scene.target_seconds and scene.target_seconds > 0)         else ic.seconds_per_shot
     p = I2VParams(
-        num_frames=frames_for(scene.target_seconds, ic.fps),
+        num_frames=snap_frames(ic.frames_for(target)),
         fps=ic.fps,
         steps=ic.distill_steps if ic.distill else ic.steps,
         guidance_scale=ic.guidance_scale,
         distill=ic.distill,
-        seed=config.keyframe.seed,                 # one seed for the render; i2v has no own seed knob
+        seed=ic.seed,
+        flow_shift=ic.flow_shift,
         feature_cache=ic.feature_cache,
     )
     if ic.negative_prompt:
