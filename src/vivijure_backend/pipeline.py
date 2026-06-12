@@ -88,6 +88,29 @@ def i2v_params_from(config: RenderConfig, scene) -> I2VParams:
     return p
 
 
+def finish_params_from(config: RenderConfig):
+    """Map the typed `FinishConfig` onto the finish engine's `FinishParams`. The enum-shaped config
+    (`interpolate` flag + `face_restore` as a `FaceRestore` member) becomes the engine's bool + the
+    chosen restorer backend string: `FaceRestore.NONE` -> face_restore off, GFPGAN/CodeFormer ->
+    on with that backend. The interpolation factor is already snapped to a power of two at config
+    validation, so it is passed straight through. One resolved params object finishes every clip in
+    the render the same way, so all clips stay codec/fps-uniform for the stream-copy concat."""
+    from .finish import FinishParams  # deferred: keep finish CPU-light and avoid an import cycle
+    from .config import FaceRestore
+
+    fc = config.finish
+    restore_on = fc.face_restore is not FaceRestore.NONE
+    return FinishParams(
+        interpolate=fc.interpolate,
+        factor=fc.interpolation_factor,
+        target_fps=fc.target_fps,
+        face_restore=restore_on,
+        face_restore_backend=(fc.face_restore.value if restore_on else FaceRestore.GFPGAN.value),
+        face_fidelity=fc.face_fidelity,
+        only_faces=fc.only_faces,
+    )
+
+
 # --------------------------------------------------------------------------- the pipeline
 
 @dataclass
@@ -141,6 +164,17 @@ class GpuPipeline:
             params=i2v_params_from(self.config, scene), progress_cb=cb,
         ).path
 
+    def _finish_clip(self, shot_id: str, in_path: Path, out_path: Path) -> Path:
+        # Finishing stage (RIFE interpolation + face restore), clip in / clip out, on the warm
+        # ModelServer so the finish models load once. Per-clip finish progress is best-effort.
+        from . import finish as _finish  # deferred: finish defers torch + the finish models
+
+        cb = self.progress.finish_cb(shot_id)
+        return _finish.finish_clip(
+            shot_id, in_path, out_path, self._model_server(),
+            params=finish_params_from(self.config), progress_cb=cb,
+        ).path
+
     # --- orchestration (CPU; the stages above are the only GPU touch points) ---
 
     def execute(self, plan: RenderPlan, bundle: Bundle, workdir: Path) -> Outputs:
@@ -185,6 +219,19 @@ class GpuPipeline:
                     workdir / "clips" / f"{sp.shot_id}.mp4")
                 out.clips.append((sp.shot_id, clip))
                 self.progress.emit("i2v_done", shot=sp.shot_id)
+
+        # 3) Finishing stage (RIFE interpolation + face restore), gated on the tier/override config.
+        # Clip in / clip out: each animated clip is lifted to delivery quality and the result REPLACES
+        # the raw clip in `out.clips`, so the off-GPU assemble merges the finished clips. Every clip
+        # runs the same finish params and is re-encoded uniformly, so the stream-copy concat stays
+        # valid. Skipped entirely when neither pass is on (draft), so the raw i2v clips ship as-is.
+        if self.config.finish.enabled and out.clips:
+            finished: list[tuple[str, Path]] = []
+            for shot_id, clip in out.clips:
+                fin = self._finish_clip(shot_id, clip, workdir / "finished" / f"{shot_id}.mp4")
+                finished.append((shot_id, fin))
+                self.progress.emit("finish_done", shot=shot_id)
+            out.clips = finished
         return out
 
     def _resolve_keyframe(self, sp, scene, bundle: Bundle, workdir: Path) -> Path | None:
