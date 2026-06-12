@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 64" role="img" aria-label="skyphusion labs">
+  <!--
+    skyphusion labs — horizontal lockup
+    Designed for light backgrounds (Cloudflare Access default, white pages, etc.)
+    For dark backgrounds, change fill="#0a0f1e" on the text to fill="#ffffff"
+    and fill="#06b6d4" on LABS stays as-is (already bright enough).
+  -->
+  <defs>
+    <!-- Sky gradient: deep blue (bottom-left) -> electric cyan (top-right), icon space coords -->
+    <linearGradient id="sky" x1="0" y1="64" x2="64" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <!-- Subtle radial sheen on the icon background (depth, not flat) -->
+    <radialGradient id="bg" cx="50%" cy="35%" r="70%">
+      <stop offset="0%"   stop-color="#17243d"/>
+      <stop offset="100%" stop-color="#0a0f1e"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Icon: dark rounded square -->
+  <rect width="64" height="64" rx="13" fill="url(#bg)"/>
+
+  <!--
+    Fusion mark: three ascending parallelogram bars, all tilted at ~21° from vertical.
+    They rise left-to-right like signal bars or a chart, reading as: ascent (sky),
+    synthesis of multiple elements (fusion), and measured progression (labs).
+    The diagonal gradient stitches them into one unified form.
+  -->
+  <path d="M 7,52 L 15,52 L 21,36 L 13,36 Z" fill="url(#sky)"/>
+  <path d="M 21,52 L 29,52 L 38,28 L 30,28 Z" fill="url(#sky)"/>
+  <path d="M 35,52 L 43,52 L 55,20 L 47,20 Z" fill="url(#sky)"/>
+
+  <!-- Wordmark -->
+  <text x="76" y="30"
+        font-family="system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif"
+        font-size="22" font-weight="700" fill="#0a0f1e" letter-spacing="-0.5">skyphusion</text>
+  <text x="77" y="49"
+        font-family="system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif"
+        font-size="11" font-weight="500" fill="#06b6d4" letter-spacing="4">LABS</text>
+</svg>
