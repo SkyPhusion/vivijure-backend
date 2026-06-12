@@ -291,18 +291,23 @@ class _patched_modules:
 
 
 def _fake_imageio(frames_in, encoded):
-    """A fake imageio.v3 module: imiter yields the given frames, immeta reports 16 fps, imwrite
-    records the encode kwargs so the test can assert the uniform (codec, pix_fmt, fps)."""
-    mod = types.ModuleType("imageio.v3")
-    mod.immeta = lambda *a, **k: {"fps": 16}
-    mod.imiter = lambda *a, **k: iter(frames_in)
+    """A fake imageio.v3 module (plus its parent `imageio` package): imiter yields the given frames,
+    immeta reports 16 fps, imwrite records the encode kwargs so the test can assert the uniform
+    (codec, pix_fmt, fps). Returns the {module_name: module} mapping for `_patched_modules` -- both
+    `imageio` and `imageio.v3` are needed because `import imageio.v3` imports the parent first."""
+    v3 = types.ModuleType("imageio.v3")
+    v3.immeta = lambda *a, **k: {"fps": 16}
+    v3.imiter = lambda *a, **k: iter(frames_in)
 
     def imwrite(path, frames, **kw):
         encoded["path"] = path
         encoded["n"] = len(frames)
         encoded["kw"] = kw
-    mod.imwrite = imwrite
-    return mod
+    v3.imwrite = imwrite
+
+    parent = types.ModuleType("imageio")
+    parent.v3 = v3
+    return {"imageio": parent, "imageio.v3": v3}
 
 
 def _frames(n):
@@ -315,7 +320,7 @@ def test_finish_clip_restores_then_interpolates_and_encodes_uniformly(tmp_path):
     server = _FakeServer(interp=_FakeInterp(), restorer=restorer)
     params = FinishParams(interpolate=True, factor=2, face_restore=True,
                           face_restore_backend="gfpgan", only_faces=False)
-    with _patched_modules({"imageio.v3": _fake_imageio(_frames(3), encoded)}):
+    with _patched_modules(_fake_imageio(_frames(3), encoded)):
         res = finish.finish_clip("shot_01", tmp_path / "in.mp4", tmp_path / "out.mp4",
                                  server, params=params)
     # restore ran on every input frame (3), THEN one interpolation pass took 3 -> 5 frames
@@ -337,7 +342,7 @@ def test_finish_clip_encodes_uniformly_even_with_no_passes_run(tmp_path):
     encoded = {}
     server = _FakeServer(interp=_FakeInterp())
     params = FinishParams(interpolate=True, factor=4)        # interpolation requested...
-    with _patched_modules({"imageio.v3": _fake_imageio(_frames(1), encoded)}):
+    with _patched_modules(_fake_imageio(_frames(1), encoded)):
         res = finish.finish_clip("shot_x", tmp_path / "in.mp4", tmp_path / "out.mp4",
                                  server, params=params)
     assert res.interpolated is False                         # 1 frame: nothing to interpolate
@@ -352,7 +357,7 @@ def test_finish_clip_fails_loud_when_a_configured_interpolator_cannot_load(tmp_p
     encoded = {}
     server = _FakeServer(interp_raises=True)
     params = FinishParams(interpolate=True, factor=2)
-    with _patched_modules({"imageio.v3": _fake_imageio(_frames(3), encoded)}):
+    with _patched_modules(_fake_imageio(_frames(3), encoded)):
         with pytest.raises(RuntimeError, match="RIFE weights missing"):
             finish.finish_clip("shot_01", tmp_path / "in.mp4", tmp_path / "out.mp4",
                                server, params=params)
@@ -362,7 +367,7 @@ def test_finish_clip_fails_loud_when_a_configured_restorer_cannot_load(tmp_path)
     encoded = {}
     server = _FakeServer(restore_raises=True)
     params = FinishParams(face_restore=True, face_restore_backend="gfpgan")
-    with _patched_modules({"imageio.v3": _fake_imageio(_frames(3), encoded)}):
+    with _patched_modules(_fake_imageio(_frames(3), encoded)):
         with pytest.raises(RuntimeError, match="GFPGAN weights missing"):
             finish.finish_clip("shot_01", tmp_path / "in.mp4", tmp_path / "out.mp4",
                                server, params=params)
