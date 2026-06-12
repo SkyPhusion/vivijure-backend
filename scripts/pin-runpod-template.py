@@ -6,7 +6,7 @@ see ../Jenkinsfile). Run this deliberately when you want the live RunPod endpoin
 pulling a new image on its next cold start.
 
   RUNPOD_API_KEY=...  RUNPOD_TEMPLATE_ID=...  \\
-    python3 scripts/pin-runpod-template.py ghcr.io/skyphusion/vivijure-backend:0.1.0
+    python3 scripts/pin-runpod-template.py ghcr.io/skyphusion-labs/vivijure-backend:0.1.0
 
 On mindcrime RUNPOD_API_KEY is available after `source ~/.bashrc`; set RUNPOD_TEMPLATE_ID to the
 vivijure-backend endpoint's template id.
