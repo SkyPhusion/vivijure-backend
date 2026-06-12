@@ -3,7 +3,7 @@
 // Mirrors the vivijure-serverless release mechanics: the image + version come from a git TAG on
 // HEAD (explicit and immutable), not a parsed commit subject. One release track:
 //
-//   backend-vX.Y.Z  ->  ghcr.io/skyphusion/vivijure-backend:X.Y.Z (+ :latest)
+//   backend-vX.Y.Z  ->  ghcr.io/skyphusion-labs/vivijure-backend:X.Y.Z (+ :latest)
 //
 // A commit push with no release tag is a NO-OP. This pipeline BUILDS + PUSHES only; deploying
 // (pinning the RunPod endpoint template to a built image) is a separate, deliberate step --
@@ -31,7 +31,7 @@ pipeline {
 
     environment {
         REGISTRY        = 'ghcr.io'
-        OWNER           = 'skyphusion'
+        OWNER           = 'skyphusion-labs'
         WORKER_IMAGE    = 'vivijure-backend'
         DOCKER_BUILDKIT = '1'
     }
