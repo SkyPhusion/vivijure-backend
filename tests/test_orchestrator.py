@@ -2,6 +2,7 @@
 it fires. These tests pin every elimination path and the cost arithmetic."""
 from vivijure_backend.contract import RenderRequest, Storyboard
 from vivijure_backend.device import Tier
+from vivijure_backend.orchestrator import kf_hash
 from vivijure_backend.orchestrator import (
     MULTI_CHAR_DEFAULTS,
     Action,
@@ -80,7 +81,7 @@ def test_injected_start_image_skips_keyframe_gen():
 
 
 def test_existing_keyframe_is_reused():
-    p = plan(_req(), _sb(TWO_SCENES), existing_keyframes={"shot_01"})
+    p = plan(_req(), _sb(TWO_SCENES), existing_keyframes={"shot_01": None})
     modes = {s.shot_id: s.keyframe_mode for s in p.scenes}
     assert modes["shot_01"] is KeyframeMode.REUSE
     assert modes["shot_02"] is KeyframeMode.GENERATE
@@ -88,6 +89,35 @@ def test_existing_keyframe_is_reused():
 
 
 # --------------------------------------------------------------------------- actions
+
+def test_hash_mismatch_forces_keyframe_regenerate():
+    """A shot in existing_keyframes with a mismatched hash must be regenerated, not reused."""
+    from vivijure_backend.contract import RenderRequest
+    req = _req()
+    cur = kf_hash(req.config.keyframe)
+    stale_hash = "0000000000000000"  # a hash that cannot match the real config hash
+    assert stale_hash != cur, "test expects stale_hash to differ from cur"
+    p = plan(req, _sb(TWO_SCENES), existing_keyframes={"shot_01": stale_hash})
+    modes = {s.shot_id: s.keyframe_mode for s in p.scenes}
+    assert modes["shot_01"] is KeyframeMode.GENERATE  # mismatch -> regenerate
+    assert modes["shot_02"] is KeyframeMode.GENERATE
+
+
+def test_hash_match_allows_keyframe_reuse():
+    """A shot in existing_keyframes with a matching hash is reused."""
+    req = _req()
+    cur = kf_hash(req.config.keyframe)
+    p = plan(req, _sb(TWO_SCENES), existing_keyframes={"shot_01": cur})
+    modes = {s.shot_id: s.keyframe_mode for s in p.scenes}
+    assert modes["shot_01"] is KeyframeMode.REUSE
+    assert modes["shot_02"] is KeyframeMode.GENERATE
+
+
+def test_none_hash_allows_reuse_for_backward_compat():
+    """A shot in existing_keyframes with None (old state, no hash stored) is reused conservatively."""
+    p = plan(_req(), _sb(TWO_SCENES), existing_keyframes={"shot_01": None})
+    assert p.scenes[0].keyframe_mode is KeyframeMode.REUSE
+
 
 def test_finalize_is_i2v_only_over_reused_keyframes():
     # finalize must never train or generate keyframes, even with nothing trained yet.
@@ -171,6 +201,6 @@ def test_cost_grows_with_quality_and_is_enumerated():
     final = plan(_req(quality="final"), _sb(TWO_SCENES))
     assert final.estimated_gpu_seconds > draft.estimated_gpu_seconds
     # every reuse/skip is spelled out for the operator
-    p = plan(_req(), _sb(TWO_SCENES), trained_slots={"A"}, existing_keyframes={"shot_01"})
+    p = plan(_req(), _sb(TWO_SCENES), trained_slots={"A"}, existing_keyframes={"shot_01": None})
     assert p.skips  # non-empty: at least the reused LoRA and reused keyframe
     assert "saved:" in p.summary()
