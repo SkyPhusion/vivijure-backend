@@ -11,6 +11,8 @@ tag drops the `backend-v` prefix).
 
 | git tag | GHCR image | source commit | built | notes |
 |---|---|---|---|---|
+| backend-v0.2.6 | 0.2.6 | ebbf858 | 2026-06-13 (fleet) | Hash-gate keyframe cache invalidation; bump lora_scale_per_slot default 0.3->0.7 (fixes dual-shot dark-blob output). 310 tests. (#53) |
+|---|---|---|---|---|
 | backend-v0.2.5 | 0.2.5 | 2e60829 | 2026-06-13 (fleet) | Re-land orphaned #37 finishing-stage deps (gfpgan/basicsr/facexlib + RIFE vendor); fix RIFE load_model path; CI import smoke gate (#51). |
 |---|---|---|---|---|
 | backend-v0.2.4 | 0.2.4 | 997568a | 2026-06-12 (fleet) | First release tagged AND pushed to origin post-mindcrime. Render-hardening batch (#40-#45) + deploy fixes (#34/#35/#38). |
