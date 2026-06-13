@@ -2,6 +2,7 @@
 leaves `<name>.rclonelink` marker files on download; the HF cache needs real symlinks."""
 from pathlib import Path
 
+from vivijure_backend.harness import models_mirror
 from vivijure_backend.harness.models_mirror import (
     DEFAULT_SKIP_REPOS,
     I2V_LAZY_REPOS,
@@ -9,6 +10,7 @@ from vivijure_backend.harness.models_mirror import (
     _reconstruct_symlinks,
     ensure_i2v_models,
     mirror_cmd,
+    start_i2v_prefetch,
 )
 
 
@@ -43,6 +45,47 @@ def test_ensure_i2v_skips_when_sentinel_present(tmp_path):
 def test_ensure_i2v_skips_when_no_r2_creds(tmp_path):
     env = {"VJ_MODELS_ROOT": str(tmp_path)}  # no R2 creds -> weights assumed pre-provisioned
     assert ensure_i2v_models(env=env, log=lambda *_: None) is False
+
+
+# --------------------------------------------------------- eager i2v prefetch (perf #1)
+
+def test_mirror_cmd_includes_multi_thread_flags():
+    cmd = mirror_cmd(Path("/x/conf"), "r2:b/src", Path("/dst"))
+    assert "--multi-thread-streams" in cmd
+    assert "8" in cmd
+    assert "--multi-thread-cutoff" in cmd
+    assert "100M" in cmd
+
+
+def test_start_i2v_prefetch_skips_warm(tmp_path, monkeypatch):
+    monkeypatch.setattr(models_mirror, "_i2v_prefetch_thread", None)
+    (tmp_path / I2V_SENTINEL).write_text("ok\n")
+    env = {"VJ_MODELS_ROOT": str(tmp_path), "R2_ACCESS_KEY_ID": "x"}
+    assert start_i2v_prefetch(env=env, log=lambda *_: None) is None
+
+
+def test_start_i2v_prefetch_skips_no_creds(tmp_path, monkeypatch):
+    monkeypatch.setattr(models_mirror, "_i2v_prefetch_thread", None)
+    env = {"VJ_MODELS_ROOT": str(tmp_path)}  # no R2 creds
+    assert start_i2v_prefetch(env=env, log=lambda *_: None) is None
+
+
+def test_ensure_i2v_joins_prefetch_thread(tmp_path, monkeypatch):
+    # Fake thread: is_alive()=True so the join branch fires; join() writes the sentinel.
+    sentinel = tmp_path / I2V_SENTINEL
+    joined = []
+
+    class _FakeThread:
+        def is_alive(self): return True
+        def join(self):
+            joined.append(True)
+            sentinel.write_text("ok\n")
+
+    monkeypatch.setattr(models_mirror, "_i2v_prefetch_thread", _FakeThread())
+    env = {"VJ_MODELS_ROOT": str(tmp_path)}
+    result = ensure_i2v_models(env=env, log=lambda *_: None)
+    assert joined, "ensure_i2v_models did not join the prefetch thread"
+    assert result is False  # sentinel written by join -> skipped
 
 
 def test_reconstructs_symlink_from_marker(tmp_path):
