@@ -17,8 +17,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable
+
+# Module-level handle for the eager i2v prefetch thread (see start_i2v_prefetch).
+# ensure_i2v_models joins it before checking the sentinel so warm behaviour applies whether
+# the pull finished in the background or still in progress when i2v_pipeline is called.
+_i2v_prefetch_thread: threading.Thread | None = None
 
 # The heavy i2v repos (Wan I2V + the Lightning distill, ~120GB), pulled LAZILY by
 # ensure_i2v_models() on the first i2v_pipeline() use. A keyframe/preview worker -- the common cheap
@@ -73,6 +79,7 @@ def mirror_cmd(conf: Path, src: str, dst: Path, *, skip_repos: tuple[str, ...] =
     """argv for one `rclone copy --links` mirror leg. Pure: built and asserted without rclone."""
     cmd = ["rclone", "--config", str(conf), "copy", "--links",
            "--transfers", "16", "--checkers", "16",
+           "--multi-thread-streams", "8", "--multi-thread-cutoff", "100M",
            "--stats", "60s", "--stats-one-line", "-v",
            "--exclude", _INCOMPLETE_GLOB]
     for repo in skip_repos:
@@ -144,11 +151,18 @@ def ensure_i2v_models(*, env: dict | None = None, log: Callable[[str], None] = p
     Idempotent via its own sentinel; returns True if a pull ran, False if skipped (warm, or no R2
     creds so weights are assumed pre-provisioned). Raises on a hard failure, same as ensure_models.
     """
+    global _i2v_prefetch_thread
     e = env if env is not None else os.environ
     hf_home = Path(e.get("HF_HOME", "/opt/models/hf-cache"))
     models_root = Path(e.get("VJ_MODELS_ROOT", "/opt/models"))
     bucket = e.get("R2_BUCKET", "vivijure")
     sentinel = models_root / I2V_SENTINEL
+
+    # Join the background prefetch thread (if started by start_i2v_prefetch) before checking
+    # the sentinel so its result is visible. If the thread failed, fall through to pull normally.
+    if _i2v_prefetch_thread is not None and _i2v_prefetch_thread.is_alive():
+        log("models_mirror: i2v prefetch in progress; waiting...")
+        _i2v_prefetch_thread.join()
 
     if sentinel.exists():
         log("models_mirror: i2v models already mirrored (sentinel present); skipping.")
@@ -169,6 +183,39 @@ def ensure_i2v_models(*, env: dict | None = None, log: Callable[[str], None] = p
     sentinel.write_text("ok\n")
     log("models_mirror: i2v model mirror from R2 complete.")
     return True
+
+
+def start_i2v_prefetch(*, env: dict | None = None, log: Callable[[str], None] = print) -> "threading.Thread | None":
+    """Eager-start the Wan I2V pull in a background thread so it overlaps LoRA training.
+
+    Call this right after ensure_models() returns (cold-start pull done, network free). The
+    background thread runs ensure_i2v_models(); ensure_i2v_models() joins it before the sentinel
+    check so i2v_pipeline() sees the weights already present rather than waiting serially.
+
+    Idempotent: a second call while a thread is running returns the existing thread. Returns None
+    on a warm worker (sentinel present) or when R2 creds are absent -- both are instant no-ops
+    that don't need a thread.
+    """
+    global _i2v_prefetch_thread
+    if _i2v_prefetch_thread is not None:
+        return _i2v_prefetch_thread
+
+    e = env if env is not None else os.environ
+    models_root = Path(e.get("VJ_MODELS_ROOT", "/opt/models"))
+    if (models_root / I2V_SENTINEL).exists() or not e.get("R2_ACCESS_KEY_ID"):
+        return None
+
+    def _pull() -> None:
+        try:
+            ensure_i2v_models(env=env, log=log)
+        except Exception as exc:
+            log(f"models_mirror: i2v prefetch error: {exc}")
+
+    t = threading.Thread(target=_pull, daemon=True, name="vj-i2v-prefetch")
+    _i2v_prefetch_thread = t
+    t.start()
+    log("models_mirror: eager i2v prefetch started (overlaps LoRA training).")
+    return t
 
 
 def _reconstruct_symlinks(root: Path, log: Callable[[str], None]) -> int:
