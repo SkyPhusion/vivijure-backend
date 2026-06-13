@@ -142,13 +142,25 @@ def animate(
     _apply_flow_shift(pipe, cfg.flow_shift)
     _set_feature_cache(pipe, cfg.feature_cache)  # per-shot: reset + (re)install, never leak across shots
     step_callback = _step_callback(progress_cb, cfg.steps)
-    frames = pipe(
-        image=image, prompt=prompt, negative_prompt=cfg.negative_prompt,
-        height=height, width=width, num_frames=cfg.num_frames,
-        num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
-        generator=torch.Generator(device="cuda").manual_seed(cfg.seed),
-        **({"callback_on_step_end": step_callback} if step_callback else {}),
-    ).frames[0]
+
+    def _run_pipe():
+        return pipe(
+            image=image, prompt=prompt, negative_prompt=cfg.negative_prompt,
+            height=height, width=width, num_frames=cfg.num_frames,
+            num_inference_steps=cfg.steps, guidance_scale=cfg.guidance_scale,
+            generator=torch.Generator(device="cuda").manual_seed(cfg.seed),
+            **({"callback_on_step_end": step_callback} if step_callback else {}),
+        ).frames[0]
+
+    try:
+        frames = _run_pipe()
+    except ValueError as _exc:
+        if "No context is set" not in str(_exc):
+            raise
+        # FBC context not set up in this diffusers build; clear the hook and run uncached
+        print(f"i2v FBC context error on {scene.id}; retrying without feature cache", flush=True)
+        _set_feature_cache(pipe, FeatureCache.NONE)
+        frames = _run_pipe()
 
     export_to_video(frames, str(out_path), fps=cfg.fps)
     return I2VResult(
