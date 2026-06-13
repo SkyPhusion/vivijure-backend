@@ -218,6 +218,49 @@ def start_i2v_prefetch(*, env: dict | None = None, log: Callable[[str], None] = 
     return t
 
 
+# Known-absent files that diffusers probes for under HF_HUB_OFFLINE=1.
+# Each tuple is (HF cache dir name, file path relative to the snapshot dir). These are files
+# that don't exist in the repos; online, diffusers gets a graceful 404 and falls back; offline,
+# the missing cache entry raises LocalEntryNotFoundError. An empty .no_exist stub at the right
+# path (written once at image build time by deploy/bake_hf_configs.py) replicates the 404
+# negative-cache entry. See write_no_exist_stubs below.
+HF_OFFLINE_STUBS: tuple[tuple[str, str], ...] = (
+    # probe 1: shard-index check for the VAE; single-file VAE has no index.json
+    ("models--SG161222--RealVisXL_V5.0", "vae/diffusion_pytorch_model.safetensors.index.json"),
+    # probe 2: same shard-index check for the xinsir ControlNet weights
+    ("models--xinsir--controlnet-openpose-sdxl-1.0", "diffusion_pytorch_model.safetensors.index.json"),
+    # probe 3: PEFT adapter_config probe for the IP-Adapter image_encoder (not a PEFT model)
+    ("models--h94--IP-Adapter", "sdxl_models/image_encoder/adapter_config.json"),
+)
+
+
+def write_no_exist_stubs(hub: Path, stubs: tuple[tuple[str, str], ...],
+                         log: Callable[[str], None] = print) -> list[Path]:
+    """Create empty HF-cache .no_exist stubs for known-absent repo files (build-time helper).
+
+    diffusers probes for certain files (shard-index .index.json, PEFT adapter_config.json) that
+    don't exist in the repos. Online these are graceful 404s. Under HF_HUB_OFFLINE=1 the missing
+    cache entry raises LocalEntryNotFoundError. An empty stub at
+    `hub/<cache-dir>/.no_exist/<revision>/<file>` replicates the negative-cache entry so the
+    graceful fallback runs instead.
+
+    The revision is read from refs/main written by snapshot_download. Returns the list of stub
+    paths created; skips entries whose refs/main doesn't exist yet (warns instead)."""
+    written = []
+    for cache_dir, absent_path in stubs:
+        ref_file = hub / cache_dir / "refs" / "main"
+        if not ref_file.exists():
+            log(f"models_mirror: no refs/main for {cache_dir}; skipping .no_exist stub")
+            continue
+        rev = ref_file.read_text().strip()
+        stub = hub / cache_dir / ".no_exist" / rev / absent_path
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text("")
+        log(f"models_mirror: .no_exist stub: {cache_dir}/.no_exist/{rev[:12]}/{absent_path}")
+        written.append(stub)
+    return written
+
+
 def _reconstruct_symlinks(root: Path, log: Callable[[str], None]) -> int:
     """Turn every `*.rclonelink` marker under `root` into the real symlink it describes (its file
     content is the link target). Idempotent; tolerant of an already-correct cache."""

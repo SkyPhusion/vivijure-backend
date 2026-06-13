@@ -147,10 +147,15 @@ def train_slot(
     # the tokenizer files directly (the diffusers SDXL path), so it works offline from the cache.
     tokenizer_one = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer")
     tokenizer_two = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer_2")
+    # local_files_only=True: transformers probes the repo tree for additional_chat_templates on
+    # from_pretrained; that tree-listing call raises under HF_HUB_OFFLINE=1. Safe here because
+    # the R2 mirror has run before lora_train is called, so the weights are in the local cache.
     text_encoder_one = CLIPTextModel.from_pretrained(
-        base, subfolder="text_encoder", torch_dtype=weight_dtype).to(device)
+        base, subfolder="text_encoder", torch_dtype=weight_dtype,
+        local_files_only=True).to(device)
     text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
-        base, subfolder="text_encoder_2", torch_dtype=weight_dtype).to(device)
+        base, subfolder="text_encoder_2", torch_dtype=weight_dtype,
+        local_files_only=True).to(device)
     unet = UNet2DConditionModel.from_pretrained(base, subfolder="unet", torch_dtype=weight_dtype).to(device)
     noise_scheduler = DDPMScheduler.from_pretrained(base, subfolder="scheduler")
 
