@@ -129,10 +129,10 @@ class MultiCharConfig:
     nature, so the regional path stays masked-IP-Adapter only.
 
     Defaults mirror `orchestrator.MULTI_CHAR_DEFAULTS` (engine=regional, pose_conditioning=True,
-    lora_scale_per_slot=0.3, ip_adapter_scale_per_slot=0.7, max_slots=2)."""
+    lora_scale_per_slot=0.7, ip_adapter_scale_per_slot=0.7, max_slots=2)."""
     regional: bool = True                     # use the regional no-bleed engine for multi-char shots
     pose_conditioning: bool = True            # OpenPose ControlNet to separate bodies
-    lora_scale_per_slot: float = 0.3          # 0..2; per-character LoRA strength in a shared frame
+    lora_scale_per_slot: float = 0.7          # 0..2; per-character LoRA strength in a shared frame
     ip_adapter_scale_per_slot: float = 0.7    # 0..1; per-region masked IP-Adapter identity pull
     max_slots: int = 2                        # 1..4; characters the no-bleed path supports at once
     controlnet_pose_scale: float = 0.55       # 0..1.5; OpenPose ControlNet conditioning scale

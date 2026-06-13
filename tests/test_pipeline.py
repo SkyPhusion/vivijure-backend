@@ -201,7 +201,7 @@ def test_execute_honors_reuse_and_pretrained(tmp_path):
     req = RenderRequest.from_dict({"action": "render", "project": "neon", "bundle_key": "x",
                                    "quality_tier": "final", "pretrained_loras": {"A": str(pre)}})
     plan = make_plan(req, bundle.storyboard,
-                     trained_slots=set(req.pretrained_loras), existing_keyframes={"shot_01"})
+                     trained_slots=set(req.pretrained_loras), existing_keyframes={"shot_01": None})
     work = tmp_path / "work"
     (work / "keyframes").mkdir(parents=True)
     (work / "keyframes" / "shot_01.png").write_bytes(b"x")   # stage the reused keyframe
@@ -222,7 +222,7 @@ def test_execute_skips_i2v_when_reused_keyframe_is_missing(tmp_path):
     bundle = _extract_bundle(tmp_path)
     req = RenderRequest.from_dict({"action": "render", "project": "neon",
                                    "bundle_key": "x", "quality_tier": "final"})
-    plan = make_plan(req, bundle.storyboard, existing_keyframes={"shot_01"})
+    plan = make_plan(req, bundle.storyboard, existing_keyframes={"shot_01": None})
     pipe = StubPipeline(req.config)
     out = pipe.execute(plan, bundle, tmp_path / "work")   # shot_01 keyframe not staged
     assert "shot_01" not in pipe.animated

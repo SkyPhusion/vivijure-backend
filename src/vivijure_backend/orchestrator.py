@@ -20,13 +20,15 @@ from enum import Enum
 
 from .contract import RenderRequest, Scene, Storyboard
 from .routing import QualityTier, Stage, Tier, gpu_for
+import hashlib
+import json
 
 # Anti-bleed defaults for the multi-character keyframe path (the standard, not cranked,
 # per-slot scales + pose conditioning that hold two identities apart).
 MULTI_CHAR_DEFAULTS: dict[str, object] = {
     "engine": "regional",
     "pose_conditioning": True,
-    "lora_scale_per_slot": 0.3,
+    "lora_scale_per_slot": 0.7,
     "ip_adapter_scale_per_slot": 0.7,
     "max_slots": 2,
     "region_gutter": 64,
@@ -111,6 +113,36 @@ class RenderPlan:
         return "\n".join(lines)
 
 
+def kf_hash(kc) -> str:
+    """Short SHA-256 hash of the keyframe render params (steps, guidance, seed, model, and the
+    multi-char anti-bleed knobs). Stored alongside each keyframe in state so an incremental
+    re-run with changed params forces regeneration instead of silently reusing a stale image.
+
+    Covers every input that changes the SDXL output but NOT the prompt or character refs -- those
+    are project-level inputs that change the bundle, not the config. If only prompt/refs changed,
+    the user supplies a new bundle and the state tar is naturally stale (different project slot).
+
+    Accepts any object with the KeyframeConfig attribute shape to avoid a circular import; the
+    type is enforced by the callers."""
+    mc = kc.multi_char
+    payload = {
+        "steps": kc.distill_steps if kc.distill else kc.steps,
+        "guidance": kc.guidance_scale,
+        "seed": kc.seed,
+        "base_model": kc.base_model,
+        "identity_method": kc.identity_method.value,
+        "width": kc.width,
+        "height": kc.height,
+        "lora_scale": mc.lora_scale_per_slot,
+        "ip_scale": mc.ip_adapter_scale_per_slot,
+        "pose_cond": mc.pose_conditioning,
+        "cn_scale": mc.controlnet_pose_scale,
+        "gutter": mc.region_gutter,
+        "max_slots": mc.max_slots,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def validate(request: RenderRequest, storyboard: Storyboard) -> list[str]:
     """Cheap preflight. Catch on the CPU what would otherwise fail minutes into a GPU job."""
     errs: list[str] = []
@@ -133,7 +165,7 @@ def plan(
     storyboard: Storyboard,
     *,
     trained_slots: set[str] = frozenset(),       # slots whose LoRA already exists (prior state)
-    existing_keyframes: set[str] = frozenset(),  # shot_ids whose keyframe is already on disk
+    existing_keyframes: dict[str, str | None] = {},  # shot_id -> stored hash (None = old state, no hash)
 ) -> RenderPlan:
     """Decide the whole render on the CPU. Nothing here touches a GPU."""
     action = Action.parse(request.action)
@@ -173,7 +205,8 @@ def plan(
     # the wasteful over-estimate this planner exists to prevent.
     scene_plans: list[ScenePlan] = []
     for sc in (scenes if (want_keyframe or want_i2v) else []):
-        mode = _keyframe_mode(sc, action, existing_keyframes, want_keyframe)
+        cur_hash = kf_hash(request.config.keyframe)
+        mode = _keyframe_mode(sc, action, existing_keyframes, want_keyframe, cur_hash)
         if mode is not KeyframeMode.GENERATE and want_keyframe:
             skips.append(f"{sc.id} keyframe: {mode.value} (no SDXL pass)")
         multi = sc.is_multi_character
@@ -202,13 +235,23 @@ def plan(
     return plan_obj
 
 
-def _keyframe_mode(scene: Scene, action: Action, existing: set[str], want_keyframe: bool) -> KeyframeMode:
+def _keyframe_mode(
+    scene: Scene, action: Action,
+    existing: dict[str, str | None],
+    want_keyframe: bool,
+    current_hash: str = "",
+) -> KeyframeMode:
     if action is Action.FINALIZE:
         return KeyframeMode.REUSE  # i2v-only reuses the preview's keyframe
     if scene.start_image:
         return KeyframeMode.INJECT  # authored / cloud-made keyframe handed in
     if want_keyframe and scene.id in existing:
-        return KeyframeMode.REUSE  # incremental re-render: already have it
+        stored = existing[scene.id]
+        if stored is None:
+            return KeyframeMode.REUSE  # old state without a hash; reuse conservatively
+        if stored == current_hash:
+            return KeyframeMode.REUSE  # params unchanged; safe to reuse
+        # hash mismatch: render params changed since the cached keyframe was drawn
     return KeyframeMode.GENERATE
 
 

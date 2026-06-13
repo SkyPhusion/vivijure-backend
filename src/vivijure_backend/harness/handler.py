@@ -63,7 +63,7 @@ def run_job(
     mirrored: bool = False,
     on_progress=None,
     trained_slots: set[str] = frozenset(),
-    existing_keyframes: set[str] = frozenset(),
+    existing_keyframes: dict[str, str | None] = {},
 ) -> dict:
     """Run one render job end to end and return the control-plane response dict.
 
@@ -94,7 +94,7 @@ def run_job(
         plan = make_plan(
             req, bundle.storyboard,
             trained_slots=set(trained_slots) | set(req.pretrained_loras),
-            existing_keyframes=set(existing_keyframes),
+            existing_keyframes=existing_keyframes,
         )
 
         # --- stage reused LoRAs from R2 (the harness owns R2; the GPU layer never touches it) ---
@@ -207,6 +207,9 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
         state_kf = bundle.root / "keyframes" / f"{shot_id}.png"
         state_kf.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, state_kf)
+        hash_src = Path(path).with_suffix(".hash")
+        if hash_src.is_file():
+            shutil.copy2(hash_src, state_kf.with_suffix(".hash"))
 
     # Clips ordered by the storyboard (never the stage's incidental order).
     ordered = order_for_storyboard(
@@ -256,7 +259,7 @@ def _finish(req: RenderRequest, plan: RenderPlan, bundle: Bundle, outputs: Outpu
     return result
 
 
-def _restore_prior_state(store, project: str, workdir: Path) -> tuple[set[str], set[str]]:
+def _restore_prior_state(store, project: str, workdir: Path) -> tuple[set[str], dict[str, str | None]]:
     """Fetch and extract the prior render's state_key into workdir/project, then derive the sets
     the planner needs to skip already-done GPU work.
 
@@ -271,7 +274,7 @@ def _restore_prior_state(store, project: str, workdir: Path) -> tuple[set[str], 
     pipeline's _resolve_keyframe checks bundle.root/keyframes/{shot_id}.png, which lands exactly
     there."""
     trained_slots: set[str] = set()
-    existing_keyframes: set[str] = set()
+    existing_keyframes: dict[str, str | None] = {}
     try:
         state_tar = workdir / "prior_state.tar.gz"
         store.get_file(keys.state_key(project), state_tar)
@@ -287,7 +290,15 @@ def _restore_prior_state(store, project: str, workdir: Path) -> tuple[set[str], 
                              if d.is_dir() and (d / ".trained").is_file()}
         kf_dir = state_root / "keyframes"
         if kf_dir.is_dir():
-            existing_keyframes = {p.stem for p in kf_dir.iterdir() if p.suffix == ".png"}
+            # Build shot_id -> stored_hash dict. Hash files are written alongside PNGs in
+            # _finish() so a warm worker can compare render params before reusing a keyframe.
+            # Old state (no .hash files) gets None as the value -- _keyframe_mode treats that
+            # as "reuse conservatively" so upgrading never forces a full regeneration.
+            for png in kf_dir.iterdir():
+                if png.suffix == ".png":
+                    hash_file = png.with_suffix(".hash")
+                    stored = hash_file.read_text().strip() if hash_file.is_file() else None
+                    existing_keyframes[png.stem] = stored
     except Exception:  # noqa: BLE001 -- any fetch/extract failure -> fresh render (safe default)
         pass
     return trained_slots, existing_keyframes

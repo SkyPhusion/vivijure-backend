@@ -283,7 +283,36 @@ def test_restore_prior_state_derives_sets_from_tar(tmp_path):
     workdir.mkdir()
     trained, existing = _restore_prior_state(StateFakeStore(), "neon", workdir)
     assert trained == {"A"}
-    assert existing == {"shot_01"}
+    assert existing == {"shot_01": None}  # no .hash file in tar -> None value
+
+
+def test_restore_prior_state_reads_hash_from_dot_hash_file(tmp_path):
+    """A .hash file alongside the PNG in state is read back as the stored hash."""
+    from vivijure_backend.harness.handler import _restore_prior_state
+
+    import tarfile, io
+    # Build a state tar with a keyframe PNG AND a .hash file alongside it
+    tar_path = tmp_path / "state.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        # keyframe PNG (no project/ prefix -- matches _make_state_tar convention)
+        png_data = b"PNG"
+        ti = tarfile.TarInfo("keyframes/shot_01.png")
+        ti.size = len(png_data)
+        tf.addfile(ti, io.BytesIO(png_data))
+        # .hash file alongside the PNG
+        h = b"abcdef1234567890"
+        hi = tarfile.TarInfo("keyframes/shot_01.hash")
+        hi.size = len(h)
+        tf.addfile(hi, io.BytesIO(h))
+
+    class StateFakeStore:
+        def get_file(self, key, dest):
+            import shutil; shutil.copy(tar_path, dest); return dest
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    trained, existing = _restore_prior_state(StateFakeStore(), "neon", workdir)
+    assert existing == {"shot_01": "abcdef1234567890"}
 
 
 def test_restore_prior_state_returns_empty_on_missing_state(tmp_path):
@@ -297,4 +326,4 @@ def test_restore_prior_state_returns_empty_on_missing_state(tmp_path):
     workdir = tmp_path / "work"
     workdir.mkdir()
     trained, existing = _restore_prior_state(FailingStore(), "fresh-project", workdir)
-    assert trained == set() and existing == set()
+    assert trained == set() and existing == {}

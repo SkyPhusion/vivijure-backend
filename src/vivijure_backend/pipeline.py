@@ -30,7 +30,7 @@ from .harness.handler import Outputs
 from .harness.progress import NullEmitter
 from .keyframe import KeyframeParams, build_prompt
 from .i2v import I2VParams, frames_for, snap_frames
-from .orchestrator import KeyframeMode, RenderPlan
+from .orchestrator import KeyframeMode, RenderPlan, kf_hash
 from .contract import Bundle
 
 # Shared no-op emitter for a pipeline run with no progress channel wired (the test default).
@@ -213,6 +213,12 @@ class GpuPipeline:
                 kf_path = self._render_keyframe(
                     scene, cast, storyboard, workdir / "keyframes" / f"{sp.shot_id}.png", lora_paths)
                 out.keyframes[sp.shot_id] = kf_path
+                # Write a param hash alongside the PNG so the next warm-worker run can skip
+                # regeneration when config is unchanged (_finish copies both into state.tar.gz).
+                try:
+                    kf_path.with_suffix(".hash").write_text(kf_hash(self.config.keyframe))
+                except Exception:
+                    pass  # hash write is best-effort; a missing file = old-state reuse behavior
                 self.progress.emit("keyframe_done", shot=sp.shot_id)
             else:
                 kf_path = self._resolve_keyframe(sp, scene, bundle, workdir)
