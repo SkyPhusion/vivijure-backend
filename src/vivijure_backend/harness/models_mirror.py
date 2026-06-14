@@ -135,6 +135,10 @@ def ensure_models(*, env: dict | None = None, log: Callable[[str], None] = print
     # `config.json -> ../../blobs/<hash>`, and an HF_HUB_OFFLINE load can't find the file. Rebuild
     # the symlinks from the markers ourselves so the cache is valid regardless of rclone's version.
     _reconstruct_symlinks(hf_home, log)
+    # Write .no_exist stubs at the R2 revision (read from refs/main after the mirror). Build-time
+    # stubs (bake_hf_configs.py) use the HF revision at build time which may differ; this call
+    # ensures stubs are always at the revision R2 seeded, which is what offline probes check.
+    write_no_exist_stubs(hf_home / "hub", HF_OFFLINE_STUBS, log)
 
     models_root.mkdir(parents=True, exist_ok=True)
     sentinel.write_text("ok\n")
