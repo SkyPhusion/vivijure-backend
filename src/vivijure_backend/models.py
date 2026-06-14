@@ -79,7 +79,9 @@ DEFAULT_SPECS: dict[ModelRole, ModelSpec] = {
     ),
     ModelRole.I2V_DISTILL: ModelSpec(
         ModelRole.I2V_DISTILL, "lightx2v/Wan2.2-Lightning", ModelFamily.AUX,
-        note="4-step distill LoRA; watch diffusers LoRA-load compat (issue #12535), LightX2V/DiffSynth is the fallback loader",
+        weight_name="Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+        note="4-step distill LoRA; no root-level .safetensors (repo uses subdirs); I2V path confirmed "
+             "from R2 listing. Watch diffusers LoRA-load compat (issue #12535), LightX2V/DiffSynth is the fallback.",
     ),
     ModelRole.INSTANTID: ModelSpec(ModelRole.INSTANTID, "InstantX/InstantID", ModelFamily.AUX),
     ModelRole.IP_ADAPTER: ModelSpec(ModelRole.IP_ADAPTER, "h94/IP-Adapter", ModelFamily.AUX),
@@ -451,7 +453,10 @@ def _try_diffusers_distill(pipe, distill_spec) -> bool:
     weight matrices (TorchaoLoraLinear cannot be quantized after a LoRA is attached, #12535).
     Returns True on success and marks the pipe as fused."""
     try:
-        pipe.load_lora_weights(distill_spec.repo_id, adapter_name="distill")
+        # weight_name is required under HF_HUB_OFFLINE=1: diffusers scans the repo to pick a file
+        # when weight_name is omitted, and that scan raises OfflineModeIsEnabled (probe 6).
+        pipe.load_lora_weights(distill_spec.repo_id, weight_name=distill_spec.weight_name,
+                               adapter_name="distill")
         pipe.fuse_lora()
         pipe.unload_lora_weights()
         pipe._vj_i2v_distill_loaded = True
@@ -489,17 +494,16 @@ def _apply_lora_delta_to_wan(pipe, distill_spec) -> bool:
     """Apply the Wan2.2-Lightning LoRA as a weight delta (B @ A * alpha/rank) directly onto each
     transformer expert's weight matrices. No diffusers LoRA injection -- works on quantized models.
 
-    POD-TODO: verify the filename and key format against the actual repo. The Wan2.2-Lightning
-    safetensors from lightx2v/Wan2.2-Lightning uses keys structured as either:
-    "transformer.<block>.<proj>.lora_A.weight" or "diffusion_model.<...>.lora_A.weight".
-    Confirm the correct prefix and alpha key name on the pod before shipping as the default."""
+    The safetensors keys use either "transformer.<block>.<proj>.lora_A.weight" or
+    "diffusion_model.<...>.lora_A.weight" prefixes; both are handled by the prefix-strip loop.
+    Alpha key naming and key format still to be confirmed on a pod (POD-TODO in the loop body)."""
     import torch
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
-    # POD-TODO: verify the actual filename in lightx2v/Wan2.2-Lightning
-    lora_path = hf_hub_download(distill_spec.repo_id,
-                                 filename="wan2.2_i2v_lora.safetensors")  # POD-TODO: confirm filename
+    # distill_spec.weight_name is the subdirectory path within the repo confirmed from R2:
+    # "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors"
+    lora_path = hf_hub_download(distill_spec.repo_id, filename=distill_spec.weight_name)
     sd = load_file(lora_path)
 
     applied = 0
