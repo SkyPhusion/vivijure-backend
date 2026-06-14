@@ -156,8 +156,13 @@ def train_slot(
     text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
         base, subfolder="text_encoder_2", torch_dtype=weight_dtype,
         local_files_only=True).to(device)
-    unet = UNet2DConditionModel.from_pretrained(base, subfolder="unet", torch_dtype=weight_dtype).to(device)
-    noise_scheduler = DDPMScheduler.from_pretrained(base, subfolder="scheduler")
+    # local_files_only=True: diffusers calls model_info() to check for a newer revision before
+    # loading; that API call raises OfflineModeIsEnabled under HF_HUB_OFFLINE=1. The R2 mirror
+    # has already run, so the weights are in the local cache -- it is safe to skip the check.
+    unet = UNet2DConditionModel.from_pretrained(
+        base, subfolder="unet", torch_dtype=weight_dtype, local_files_only=True).to(device)
+    noise_scheduler = DDPMScheduler.from_pretrained(base, subfolder="scheduler",
+                                                    local_files_only=True)
 
     for module in (vae, text_encoder_one, text_encoder_two, unet):
         module.requires_grad_(False)
