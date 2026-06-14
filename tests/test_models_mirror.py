@@ -5,12 +5,14 @@ from pathlib import Path
 from vivijure_backend.harness import models_mirror
 from vivijure_backend.harness.models_mirror import (
     DEFAULT_SKIP_REPOS,
+    HF_OFFLINE_STUBS,
     I2V_LAZY_REPOS,
     I2V_SENTINEL,
     _reconstruct_symlinks,
     ensure_i2v_models,
     mirror_cmd,
     start_i2v_prefetch,
+    write_no_exist_stubs,
 )
 
 
@@ -110,6 +112,51 @@ def test_reconstructs_symlink_from_marker(tmp_path):
 def test_idempotent_and_quiet_when_no_markers(tmp_path):
     (tmp_path / "f.json").write_text("{}")
     assert _reconstruct_symlinks(tmp_path, log=lambda *_: None) == 0
+
+
+# --------------------------------------------------------- HF offline .no_exist stub writer
+
+def test_write_no_exist_stubs_creates_empty_files(tmp_path):
+    # Simulate a post-snapshot_download HF cache with refs/main populated.
+    cache_dir = tmp_path / "models--Org--Repo"
+    (cache_dir / "refs").mkdir(parents=True)
+    (cache_dir / "refs" / "main").write_text("abc123deadbeef\n")
+
+    stubs = [("models--Org--Repo", "subfolder/weights.index.json")]
+    written = write_no_exist_stubs(tmp_path, stubs, log=lambda *_: None)
+
+    assert len(written) == 1
+    stub = cache_dir / ".no_exist" / "abc123deadbeef" / "subfolder" / "weights.index.json"
+    assert stub.exists()
+    assert stub.read_text() == ""
+
+
+def test_write_no_exist_stubs_skips_missing_refs(tmp_path):
+    # If refs/main doesn't exist (snapshot_download failed), skip with a warning; no crash.
+    stubs = [("models--Missing--Repo", "some/file.json")]
+    written = write_no_exist_stubs(tmp_path, stubs, log=lambda *_: None)
+    assert written == []
+
+
+def test_write_no_exist_stubs_idempotent(tmp_path):
+    cache_dir = tmp_path / "models--X--Y"
+    (cache_dir / "refs").mkdir(parents=True)
+    (cache_dir / "refs" / "main").write_text("rev1\n")
+    stubs = [("models--X--Y", "a/b.json")]
+    write_no_exist_stubs(tmp_path, stubs, log=lambda *_: None)
+    write_no_exist_stubs(tmp_path, stubs, log=lambda *_: None)  # second call: no error
+    assert (cache_dir / ".no_exist" / "rev1" / "a" / "b.json").exists()
+
+
+def test_hf_offline_stubs_covers_known_probes():
+    paths = {p for _, p in HF_OFFLINE_STUBS}
+    # Probe 1: VAE shard-index (diffusers checks for sharded weights; single-file VAE has none)
+    assert "vae/diffusion_pytorch_model.safetensors.index.json" in paths
+    # Probe 2: ControlNet shard-index
+    assert "diffusion_pytorch_model.safetensors.index.json" in paths
+    # Probe 3: IP-Adapter image_encoder PEFT adapter_config (IP-Adapter is not a PEFT model)
+    assert "sdxl_models/image_encoder/adapter_config.json" in paths
+    assert len(HF_OFFLINE_STUBS) == 3  # probe 4 fixed in lora_train.py; update if more added
 
 
 def test_overwrites_a_stale_nonsymlink(tmp_path):
