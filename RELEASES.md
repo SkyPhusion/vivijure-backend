@@ -11,6 +11,12 @@ tag drops the `backend-v` prefix).
 
 | git tag | GHCR image | source commit | built | notes |
 |---|---|---|---|---|
+| backend-v0.2.10 | 0.2.10 | d2f6b4e | 2026-06-14 (fleet) | fix(mirror): i2v prefetch self-join -- ensure_i2v_models skips join() when called from the prefetch thread itself (RuntimeError "cannot join current thread"); prefetch now overlaps LoRA training as intended. 319 tests. |
+|---|---|---|---|---|
+| backend-v0.2.9 | 0.2.9 | b2ef825 | 2026-06-14 (fleet) | fix(mirror): write .no_exist stubs at R2 revision not build-time HF revision -- stubs now written inside ensure_models() after R2 mirror so refs/main holds the correct (R2-seeded) revision. Fixes HF_HUB_OFFLINE=1 probe failures on cold start. 318 tests. |
+|---|---|---|---|---|
+| backend-v0.2.8 | 0.2.8 | 7aadeb2 | 2026-06-14 (fleet) | feat: eager Wan I2V prefetch + --multi-thread-streams (#61); HF offline support -- fix 4 HF Hub probes (#62). Was superseded same day by 0.2.9 (build-time stub revision mismatch). 318 tests. |
+|---|---|---|---|---|
 | backend-v0.2.7 | 0.2.7 | aee1ca9 | 2026-06-13 (fleet) | FBC context fallback: standard/final tier i2v retries uncached on ValueError("No context is set") from diffusers FirstBlockCache hook. Caught in load test. 310 tests. (#57) |
 |---|---|---|---|---|
 | backend-v0.2.6 | 0.2.6 | ebbf858 | 2026-06-13 (fleet) | Hash-gate keyframe cache invalidation; bump lora_scale_per_slot default 0.3->0.7 (fixes dual-shot dark-blob output). 310 tests. (#53) |

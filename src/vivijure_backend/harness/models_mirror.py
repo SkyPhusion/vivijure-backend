@@ -164,7 +164,11 @@ def ensure_i2v_models(*, env: dict | None = None, log: Callable[[str], None] = p
 
     # Join the background prefetch thread (if started by start_i2v_prefetch) before checking
     # the sentinel so its result is visible. If the thread failed, fall through to pull normally.
-    if _i2v_prefetch_thread is not None and _i2v_prefetch_thread.is_alive():
+    # Guard against calling join() on the current thread (which happens when ensure_i2v_models
+    # is called from _within_ the prefetch thread via start_i2v_prefetch._pull).
+    if (_i2v_prefetch_thread is not None
+            and _i2v_prefetch_thread.is_alive()
+            and threading.current_thread() is not _i2v_prefetch_thread):
         log("models_mirror: i2v prefetch in progress; waiting...")
         _i2v_prefetch_thread.join()
 

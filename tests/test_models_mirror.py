@@ -90,6 +90,18 @@ def test_ensure_i2v_joins_prefetch_thread(tmp_path, monkeypatch):
     assert result is False  # sentinel written by join -> skipped
 
 
+def test_ensure_i2v_no_self_join_when_called_from_prefetch_thread(tmp_path, monkeypatch):
+    # When ensure_i2v_models is called from within the prefetch thread itself (via
+    # start_i2v_prefetch._pull), _i2v_prefetch_thread IS threading.current_thread().
+    # Without the guard, join() raises RuntimeError("cannot join current thread").
+    import threading
+    monkeypatch.setattr(models_mirror, "_i2v_prefetch_thread", threading.current_thread())
+    # No R2 creds -> returns False via "no creds" path; the point is no RuntimeError.
+    env = {"VJ_MODELS_ROOT": str(tmp_path)}
+    result = ensure_i2v_models(env=env, log=lambda *_: None)
+    assert result is False
+
+
 def test_reconstructs_symlink_from_marker(tmp_path):
     # mimic an HF-cache layout: a blob + a snapshot dir whose file is an .rclonelink marker
     (tmp_path / "blobs").mkdir()
